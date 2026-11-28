@@ -35,9 +35,14 @@ class RegistrosConfigFlow(ConfigFlow, domain=DOMAIN):
     ):
         errors = {}
         if user_input is not None:
-            data = dict(entry.data) if entry else {}
-            data.update(user_input)
-            if entry and not user_input.get(CONF_API_KEY, "").strip():
+            data = {
+                CONF_URL: entry.data[CONF_URL]
+                if step == "reauth_confirm"
+                else user_input[CONF_URL],
+                CONF_CENTRE_ID: entry.data[CONF_CENTRE_ID] if entry else user_input[CONF_CENTRE_ID],
+                CONF_API_KEY: user_input.get(CONF_API_KEY, ""),
+            }
+            if entry and step == "reconfigure" and not data[CONF_API_KEY].strip():
                 data[CONF_API_KEY] = entry.data[CONF_API_KEY]
             try:
                 data[CONF_URL] = normalize_url(data[CONF_URL])
@@ -70,21 +75,18 @@ class RegistrosConfigFlow(ConfigFlow, domain=DOMAIN):
                         return self.async_abort(reason="already_configured")
                 if entry:
                     # Preserve registry IDs when the same installation changes its URL/key.
-                    data["legacy_auth"] = False
-                    return self.async_update_reload_and_abort(
-                        entry, data_updates=data, unique_id=identity
-                    )
+                    return self.async_update_reload_and_abort(entry, data=data, unique_id=identity)
                 await self.async_set_unique_id(identity)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=f"Registros Cámaras · {data[CONF_CENTRE_ID]}", data=data
                 )
         fields = {}
-        if step != "reauth_confirm" or (entry and entry.data.get("legacy_auth")):
+        if step != "reauth_confirm":
             fields[vol.Required(CONF_URL)] = TextSelector(
                 TextSelectorConfig(type=TextSelectorType.URL)
             )
-        if not entry or entry.data.get("legacy_auth"):
+        if not entry:
             fields[vol.Required(CONF_CENTRE_ID, default=DEFAULT_CENTRE)] = str
         marker = vol.Optional if step == "reconfigure" else vol.Required
         fields[marker(CONF_API_KEY)] = TextSelector(

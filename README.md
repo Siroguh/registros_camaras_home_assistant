@@ -2,27 +2,32 @@
 
 Integración de **Registros Cámaras 2**, mantenida en
 [Siroguh/registros_camaras_home_assistant](https://github.com/Siroguh/registros_camaras_home_assistant).
-La versión 1.0 sustituye al cliente del antiguo servidor `registros_camaras`.
 Usa la API autenticada de la aplicación nueva; no consulta directamente D1.
 
 ## Instalación y configuración
 
 Requiere Home Assistant **2026.10.3 o posterior** y un servidor que implemente
 `GET /api/integration/:centreId`, `GET /api/environment/streams/:centreId` y
-`POST /api/environment/updates`, versión de contrato 1. Actualizar el servidor
-antes de instalar la integración 1.1.
+`POST /api/environment/updates`, versión de contrato 1, con confirmación durable
+final `ReadingTransaction`.
 
 1. Añade este repositorio como integración personalizada en HACS, o en la
    Marketplace integrada de HA 2026.11 o posterior.
 2. Instala y reinicia Home Assistant.
 3. En **Ajustes → Dispositivos y servicios → Añadir integración**, busca Registros Cámaras.
 4. Introduce la URL raíz de la aplicación, el centro (por defecto `villarroya-01-01`)
-   y una **clave API nativa de Better Auth**, creada desde **Cuenta** en la aplicación.
+    y una **clave API nativa de Better Auth**, creada desde **Cuenta** en la aplicación.
+
+Para instalación manual, extrae el ZIP de la release en el directorio de configuración
+de HA: debe quedar `custom_components/registros_camaras/manifest.json`. Reinicia HA
+y añade la integración siguiendo los pasos 3 y 4. La configuración actual usa
+entradas nativas de versión 2; reautenticación cambia la clave y reconfiguración
+cambia la URL conservando el centro.
 
 La URL debe ser accesible desde HA. Para desarrollo puede ser
 `https://omarchythinkpad.powan-bee.ts.net:1301` mientras `vp run dev` esté activo.
 No uses `localhost` para apuntar a otro ordenador. Se valida TLS y no se siguen
-redirecciones de las peticiones autenticadas. Las claves antiguas `rc_` no sirven.
+redirecciones de las peticiones autenticadas.
 La integración nunca entrega la clave a las tarjetas ni a los diagnósticos.
 
 No se ha enviado este repositorio al catálogo público: se instala como repositorio
@@ -30,12 +35,13 @@ personalizado. `hacs.json` sirve para HACS y Marketplace; no es una app/add-on d
 
 ## Envío de actualizaciones de sensores
 
-La integración 1.1 escucha cada reporte de los sensores asignados por el servidor,
+La integración escucha cada reporte de los sensores asignados por el servidor,
 incluidos los que repiten exactamente el valor y los atributos. La URL interna o
 externa de este HA debe coincidir con `source` de esas asociaciones. Los eventos
 se copian inmediatamente y se agrupan sin perder muestras (hasta 100 por lote de
 la misma fuente y asociación, ventana de dos segundos). Los reportes iguales conservan identidad propia incluso
-si comparten timestamp.
+si comparten timestamp. Cada `sourceEventId` identifica un reporte; el `commandId`
+identifica su lote de transporte y se conserva junto al payload en cada reintento.
 
 Una cola con `homeassistant.helpers.storage.Store`, en la clave versionada
 `registros_camaras.updates.<entry_id>`, conserva muestras y lotes hasta recibir
@@ -44,15 +50,11 @@ el mismo UUID y contenido; un reinicio o una respuesta HTTP perdida no duplica l
 lectura. El I/O y la serialización se ejecutan fuera del event loop. La durabilidad
 comienza al verificar el guardado: un apagado abrupto anterior puede perder lo todavía en RAM.
 No borrar la cola para resolver una incidencia de conexión.
-El índice usa la versión de Store 2 y migra el índice v1 conservando muestras,
-cursores y UUID/payload pendiente. Un cliente antiguo no puede abrir el índice v2:
-así se impide que desconozca los bloqueados y los reenvíe con comandos nuevos.
-Los segmentos nuevos separan fuente y asociación, igual que los lotes de envío:
+El índice usa la versión de Store 2. Los segmentos separan fuente y asociación,
+igual que los lotes de envío:
 sus ACK avanzan el prefijo sin reescribir las muestras de otras asociaciones.
-Los segmentos mixtos anteriores se reagrupan en el siguiente commit, conservando
-sus archivos hasta verificar el índice nuevo y manteniendo UUID/payload congelados.
 La regresión intercalada de 36 asociaciones y 3600 reportes no reescribe segmentos
-al drenar una cola nueva; una cola legada se reagrupa una sola vez.
+al drenar la cola.
 Las muestras se guardan en segmentos inmutables de hasta 1000 reportes; los
 metadatos confirman segmentos, cursores y ACK juntos. Drenar 50 000 reportes en la
 regresión escribe unos 17,2 MB, con commits de hasta 34 KB, sin reescribir la cola
@@ -86,8 +88,9 @@ Si falla la primera escritura y su limpieza durante setup, HA mantiene el
 reintento automático de configuración. Las entradas ya cargadas conservan su
 vaciado completo durante descarga/apagado.
 
-Recorder reconcilia huecos cada cinco minutos desde el inicio del transporte o el
-último cursor persistido. Fija cada ventana, espera la sincronización del escritor
+Recorder reconcilia huecos cada cinco minutos desde `historyFrom` de cada asociación
+o su último cursor persistido. El backfill inicial respeta ese instante del servidor,
+incluso cuando precede al inicio de la captura live. Fija cada ventana, espera la sincronización del escritor
 Recorder con una barrera encolada (también con `commit_interval=60` y un evento
 desencolado aún en proceso); un timeout conserva el cursor. Excluye estados
 sintéticos. Los cambios coincidentes usan tiempo, huella del estado textual y ordinal;
@@ -116,7 +119,6 @@ puede completarlo antes del envío. Los lotes ya preparados conservan su payload
 Estos históricos incompletos tienen un cupo separado de 1000 reportes: no consumen
 la capacidad de captura/envío live. Si se llena, la recuperación conserva su cursor
 y queda pendiente; captura y entrega continúan aunque nunca aparezca la unidad.
-Las filas anteriores que excedan ese cupo se conservan sin permitir que crezca.
 Los datos recuperados son históricos y nunca renuevan su tiempo ni activan alertas
 antiguas. Recorder no conserva necesariamente reportes idénticos: no puede recuperar
 todos los reportes durante una pausa de captura, ni datos purgados o excluidos.
@@ -129,9 +131,7 @@ contrato o asociación conservan el lote rechazado para corregir su causa.
 El ACK final de ingestión exige `commandId` idéntico al UUID enviado, stream exacto
 `ReadingTransaction/<UUID>`, versión de tipo entero entre 4 y 103 y
 `eventId: ReadingTransaction/<UUID>:<version>`. HA valida ese contrato sin replicar
-el agrupamiento de familias de Domain. Para comandos aceptados antes de la
-actualización conserva compatibilidad con el recibo legado exacto:
-`ReadingIngestion/<UUID>`, versión entera 1 y `eventId: ReadingIngestion/<UUID>:1`.
+el agrupamiento de familias de Domain.
 Booleans, otros streams/UUID, versiones fuera de contrato o eventId incoherentes
 no confirman la entrega; el mismo lote permanece pendiente de reintento.
 Si queda capacidad parcial, el writer reduce el prefijo pendiente hasta que cabe,
@@ -154,9 +154,8 @@ este contrato para aislar automáticamente el rechazo de una asociación cerrada
 
 El lote demostrado como rechazado se conserva íntegro en un Store inmutable con
 su UUID/payload y razón; **no es un ACK**, no se descartan ni reasignan sus lecturas.
-Un lote mixto de una versión anterior queda entero bloqueado: sus filas sanas
-tampoco se reenvían bajo un UUID nuevo. Las otras filas pendientes pueden avanzar;
-los nuevos lotes separan asociaciones para evitar ese bloqueo mixto.
+Las otras asociaciones pendientes pueden avanzar: cada lote pertenece a una sola
+fuente y asociación.
 Los bloqueados comparten el presupuesto total de 50 000 muestras más la reserva
 de apagado de 10 000; no son almacenamiento ilimitado ni se borran para liberar
 capacidad. Al agotar ese total se pausa la captura, aunque continúa el envío de
@@ -188,8 +187,8 @@ tarjetas y conservar los indicadores visuales de cámaras ocupadas.
 
 ## Acciones nativas
 
-Las llamadas de usuario requieren administrador de Home Assistant, como en el
-bridge anterior. Las automatizaciones internas pueden utilizar las mismas acciones.
+Las llamadas de usuario requieren administrador de Home Assistant.
+Las automatizaciones internas pueden utilizar las mismas acciones.
 
 Todas están bajo `registros_camaras`, tienen campos en el editor de acciones y
 admiten `return_response`/`response_variable`:
@@ -213,6 +212,9 @@ la misma operación conserva el UUID, revisión y datos, incluso tras reiniciar 
 Nunca se reintenta automáticamente una escritura con otra revisión. Un conflicto
 requiere consultar y revisar los datos; un fallo de transporte puede significar que
 ya fue aceptada. Una lectura fallida después de la aceptación no oculta su recibo.
+Los recibos de negocio requieren `commandId`, `eventId`, `stream` y una `version`
+entera no negativa, vinculados al comando enviado. El identificador del hecho de
+negocio puede ser independiente del stream y la versión.
 
 ## Tarjetas
 
@@ -223,7 +225,6 @@ Las tarjetas personalizadas
 [registros_camaras_cards](https://github.com/Siroguh/registros_camaras_cards) **1.0+**
 usan estas mismas acciones nativas. Conservan cámara/consignas, alta de lotes,
 movimientos totales/parciales, procedencias, corrección, diálogos y editores.
-El bridge WebSocket `registros_camaras/operation` anterior se ha retirado.
 
 Para una tarjeta propia:
 
@@ -241,20 +242,6 @@ await hass.callWS({
   return_response: true
 });
 ```
-
-## Actualizar desde el cliente antiguo
-
-La entrada v1 se migra a v2 y pide la dirección y clave del servidor nuevo.
-Actualizar la integración Python requiere reiniciar HA; actualizar solo las tarjetas
-requiere recargar el navegador. Sustituir los archivos debe eliminar también los
-antiguos `bridge.py` y `notifications.py`. Las reglas de notificación permanecen en
-el servidor; este cliente no añade avisos automáticos.
-
-Los identificadores internos de entidad han cambiado. Al sustituir una entrada,
-hay que portar las referencias del dashboard (incluidas las embebidas en estilos
-Bubble Card), y retirar recursos/entidades antiguos. Conservar previamente copia
-del dashboard y del componente. La nueva tarjeta acepta las mismas opciones YAML:
-`entry_id`, `location_id`, `title`, `temperature_entity`, `humidity_entity`.
 
 ## Plantilla y desarrollo
 

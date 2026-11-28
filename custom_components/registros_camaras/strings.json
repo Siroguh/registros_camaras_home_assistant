@@ -3,15 +3,15 @@
   "config": {
     "step": {
       "user": {"title": "Connect Registros Cámaras 2", "description": "Use the application URL and a native API key created in Account. The server must provide integration API v1.", "data": {"url": "Application URL", "centre_id": "Centre ID", "api_key": "API key"}},
-      "reauth_confirm": {"title": "Update connection credentials", "description": "Enter a native API key from the new application. When upgrading the legacy integration, also enter the new server URL.", "data": {"url": "Application URL", "api_key": "API key"}},
+      "reauth_confirm": {"title": "Update connection credentials", "description": "Enter a native API key created in Account for this application and centre.", "data": {"api_key": "API key"}},
       "reconfigure": {"title": "Update connection", "description": "Keep the same centre. Leave the key empty to preserve it.", "data": {"url": "Application URL", "api_key": "API key (optional)"}}
     },
     "error": {"invalid_address": "Enter an HTTP(S) origin and a valid centre ID.", "invalid_auth": "The API key is invalid or revoked.", "cannot_connect": "Cannot reach the application.", "incompatible_api": "The server, centre or API version is incompatible."},
-    "abort": {"already_configured": "This server and centre are already configured.", "reauth_successful": "Connection updated.", "reconfigure_successful": "Connection updated."}
+    "abort": {"already_configured": "This server and centre are already configured."}
   },
   "entity": {
     "sensor": {
-      "setpoint_source": {"name": "Setpoint source"}, "manual_end": {"name": "Manual setpoint end"},
+      "setpoint_source": {"name": "Setpoint source", "state": {"manual": "Manual", "automatic": "Automatic", "none": "None"}}, "manual_end": {"name": "Manual setpoint end"},
       "quantity": {"name": "Quantity"}, "lots": {"name": "Lots"},
       "plan_status": {"name": "Plan status", "state": {"empty": "Empty", "no_plan": "No plan", "no_phase": "No phase", "compatible": "Compatible", "conflict": "Conflict"}},
       "temperature_min": {"name": "Minimum temperature setpoint"}, "temperature_max": {"name": "Maximum temperature setpoint"},
@@ -21,5 +21,46 @@
     },
     "binary_sensor": {"connection": {"name": "Connection"}, "proposal_pending": {"name": "Pending proposal"}, "proposal_overdue": {"name": "Overdue proposal"}, "conflict": {"name": "Plan conflict"}, "manual_active": {"name": "Manual setpoint active"}},
     "button": {"refresh": {"name": "Refresh"}}
+  },
+  "services": {
+    "get_snapshot": {"name": "Get centre snapshot", "description": "Read the authoritative revision, locations and tasks. Pending means reconciliation is in progress.", "fields": {
+      "config_entry_id": {"name": "Connection"}
+    }},
+    "get_lots": {"name": "Get lots", "description": "Read an inventory page. Use nextBefore as before until it is null.", "fields": {
+      "config_entry_id": {"name": "Connection"}, "before": {"name": "Before cursor"}, "search": {"name": "Search"}, "limit": {"name": "Page size"}
+    }},
+    "get_lot": {"name": "Get lot", "fields": {
+      "config_entry_id": {"name": "Connection"}, "lot_id": {"name": "Lot ID"}
+    }},
+    "get_movement_history": {"name": "Get movement history", "fields": {
+      "config_entry_id": {"name": "Connection"}, "lot_id": {"name": "Lot ID"}
+    }},
+    "get_movement_options": {"name": "Get movement availability", "fields": {
+      "config_entry_id": {"name": "Connection"}, "lot_id": {"name": "Lot ID"}, "occurred_on": {"name": "Effective date"}, "correcting": {"name": "Movement being corrected"}
+    }},
+    "confirm_proposal": {"name": "Confirm exact proposal", "description": "Use the displayed proposal ID and centre revision. Review new data after a conflict.", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)", "description": "Generate once and retain with the payload for every retry."}, "expected_revision": {"name": "Observed centre revision"}, "location_id": {"name": "Location ID"}, "proposal_id": {"name": "Proposal ID"}
+    }},
+    "complete_task": {"name": "Record task result", "description": "Send a typed result. Completing remove_product does not move stock.", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)"}, "expected_revision": {"name": "Observed centre revision"}, "task_id": {"name": "Task ID"}, "task_revision": {"name": "Observed task revision"}, "result": {"name": "Typed result"}
+    }},
+    "create_lot": {"name": "Create lot", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)"}, "expected_revision": {"name": "Observed centre revision"}, "code": {"name": "Lot code"}, "quantity": {"name": "Quantity"}, "started_on": {"name": "Start date"}
+    }},
+    "create_movement": {"name": "Record movement", "description": "Destinations contain locationId, quantity and optional contributions. The API validates availability and origin.", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)"}, "expected_revision": {"name": "Observed centre revision"}, "lot_id": {"name": "Lot ID"}, "occurred_on": {"name": "Effective date"}, "source_location_id": {"name": "Source location ID"}, "destinations": {"name": "Destinations"}, "mix_sources": {"name": "Mix origins"}, "notes": {"name": "Notes"}
+    }},
+    "correct_movement": {"name": "Correct movement with audit trail", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)"}, "expected_revision": {"name": "Observed centre revision"}, "lot_id": {"name": "Lot ID"}, "occurred_on": {"name": "Effective date"}, "source_location_id": {"name": "Source location ID"}, "destinations": {"name": "Destinations"}, "mix_sources": {"name": "Mix origins"}, "notes": {"name": "Notes"}, "movement_id": {"name": "Movement ID"}, "reason": {"name": "Reason"}
+    }},
+    "schedule_manual": {"name": "Schedule manual setpoint", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)"}, "expected_revision": {"name": "Observed centre revision"}, "location_id": {"name": "Location ID"}, "reason": {"name": "Reason"}, "limits": {"name": "Limits"}, "starts_at": {"name": "Starts at", "description": "Unix timestamp in milliseconds."}, "ends_at": {"name": "Ends at", "description": "Unix timestamp in milliseconds."}
+    }},
+    "replace_manual": {"name": "Replace manual setpoint", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)"}, "expected_revision": {"name": "Observed centre revision"}, "location_id": {"name": "Location ID"}, "reason": {"name": "Reason"}, "limits": {"name": "Limits"}, "starts_at": {"name": "Starts at", "description": "Unix timestamp in milliseconds."}, "ends_at": {"name": "Ends at", "description": "Unix timestamp in milliseconds."}, "manual_id": {"name": "Manual setpoint ID"}
+    }},
+    "finish_manual": {"name": "Finish manual setpoint", "fields": {
+      "config_entry_id": {"name": "Connection"}, "command_id": {"name": "Command ID (UUID)"}, "expected_revision": {"name": "Observed centre revision"}, "location_id": {"name": "Location ID"}, "manual_id": {"name": "Manual setpoint ID"}, "reason": {"name": "Reason"}
+    }}
   }
 }

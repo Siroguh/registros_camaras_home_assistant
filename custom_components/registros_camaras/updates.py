@@ -84,9 +84,7 @@ class Updates:
         self.paused = False
         self.error: str | None = None
         self.recovery_error: str | None = None
-        self.queue_size = 0
         self.unrecoverable_reports = 0
-        self.started_at = int(datetime.now(UTC).timestamp() * 1000)
         self.prepared = False
         self.change_counts: dict[str, tuple[datetime, dict[str, int]]] = {}
         self.stop_task: asyncio.Task | None = None
@@ -107,7 +105,6 @@ class Updates:
         ).hexdigest()
         await self.spool.bind(destination)
         self.prepared = True
-        self.queue_size = await self.spool.size()
         self.paused = await self.spool.deliverable_size() >= MAX_REPORTS
         if "manifest" in self.spool.data:
             # Install listeners before either HTTP request can wait on an offline server.
@@ -115,7 +112,6 @@ class Updates:
 
     async def start(self) -> None:
         await self.prepare()
-        self.queue_size = await self.spool.size()
         self.paused = await self.spool.deliverable_size() >= MAX_REPORTS
         try:
             await self.refresh()
@@ -242,7 +238,7 @@ class Updates:
         for assignment in assignments:
             await self.spool.ensure_cursor(
                 assignment["id"],
-                max(assignment["historyFrom"], self.started_at - 10000),
+                assignment["historyFrom"],
             )
         self.assignments = assignments
         self.subscribe()
@@ -353,7 +349,6 @@ class Updates:
             while not self.stopping:
                 try:
                     batch = await self.spool.next_batch(self.client.centre_id)
-                    self.queue_size = await self.spool.size()
                     if await self.spool.deliverable_size() >= MAX_REPORTS:
                         self.paused = True
                         self.unsubscribe()
@@ -408,11 +403,11 @@ class Updates:
         for assignment in assignments:
             if self.stopping:
                 return False
-            target = min(until, assignment["endsAt"] or until)
-            initial = max(assignment["historyFrom"], self.started_at - 10000)
-            start = await self.spool.cursor(assignment["id"], initial)
-            # A bounded window per assignment/pass keeps recovery and live ingestion responsive.
-            end = min(target, start + 300000)
+            target = min(until, assignment["endsAt"]) if assignment["endsAt"] is not None else until
+            start = await self.spool.cursor(assignment["id"], assignment["historyFrom"])
+            # The indexed native reader caps actual rows, not elapsed time. An empty
+            # interval (including epoch -> retained history) costs one bounded query.
+            end = target
             if end <= start:
                 continue
             try:

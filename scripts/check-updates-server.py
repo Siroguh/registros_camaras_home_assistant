@@ -14,12 +14,13 @@ from uuid import UUID
 import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_URL
 from homeassistant.core import HomeAssistant
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from custom_components.registros_camaras.api import RegistrosClient, UpdatesRejected  # noqa: E402
-from custom_components.registros_camaras.const import DOMAIN  # noqa: E402
+from custom_components.registros_camaras.const import CONF_CENTRE_ID, DOMAIN  # noqa: E402
 from custom_components.registros_camaras.update_store import UpdateStore, identity  # noqa: E402
 from custom_components.registros_camaras.updates import Updates  # noqa: E402
 
@@ -114,8 +115,11 @@ async def check(config: dict) -> dict:
     healthy_source = config["healthySource"]
     require(type(rejected["apiVersion"]) is int and rejected["apiVersion"] == 1, "api_version")
     UUID(rejected["commandId"])
-    require(2 <= len(rejected["readings"]) <= 100, "mixed_batch_size")
-    require(len({row["assignmentId"] for row in rejected["readings"]}) >= 2, "mixed_assignments")
+    require(1 <= len(rejected["readings"]) <= 100, "batch_size")
+    require(len({row["assignmentId"] for row in rejected["readings"]}) == 1, "single_assignment")
+    require(
+        healthy["assignmentId"] != rejected["readings"][0]["assignmentId"], "healthy_assignment"
+    )
     original_ids = {identity(rejected["source"], row) for row in rejected["readings"]}
     require(len(original_ids) == len(rejected["readings"]), "distinct_original_identities")
     require(
@@ -132,7 +136,7 @@ async def check(config: dict) -> dict:
         version=2,
         minor_version=1,
         title="Disposable cross-check",
-        data={},
+        data={CONF_URL: config["url"], CONF_CENTRE_ID: rejected["centreId"]},
         options={},
         source="user",
         unique_id=None,
@@ -153,8 +157,11 @@ async def check(config: dict) -> dict:
                 require(assignment["source"] == healthy_source, "healthy_source_binding")
                 require(assignment["endsAt"] is None, "healthy_assignment_active")
                 require(healthy["observedAt"] >= assignment["startsAt"], "healthy_assignment_start")
-                # Keep the legacy mixed envelope; next_batch normally separates mappings.
-                spool = await restore(hass, entry)
+                # Freeze the caller's current single-assignment command before restart.
+                bootstrap = Updates(hass, entry, client)
+                bootstrap.spool = ObservedStore(hass, entry.entry_id)
+                await bootstrap.prepare()
+                spool = bootstrap.spool
                 await spool.append([(rejected["source"], row) for row in rejected["readings"]])
                 await spool.save({**spool.data, "batch": rejected})
                 spool = await restore(hass, entry)

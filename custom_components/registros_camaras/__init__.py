@@ -10,7 +10,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import ApiError, AuthenticationError, RegistrosClient, Snapshot
-from .const import CONF_CENTRE_ID, DEFAULT_CENTRE, DOMAIN
+from .const import CONF_CENTRE_ID, DOMAIN
 from .coordinator import RegistrosConfigEntry, RegistrosCoordinator
 from .services import async_register_services
 
@@ -33,8 +33,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: RegistrosConfigEntry) -> bool:
-    if entry.data.get("legacy_auth"):
-        raise ConfigEntryAuthFailed("Configure the new server URL and a native Better Auth API key")
     client = RegistrosClient(
         async_get_clientsession(hass),
         entry.data[CONF_URL],
@@ -89,20 +87,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: RegistrosConfigEntry) -
     if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         return False
     await entry.runtime_data.updates.stop()
-    return True
-
-
-async def async_migrate_entry(hass: HomeAssistant, entry: RegistrosConfigEntry) -> bool:
-    if entry.version > 2:
-        return False
-    if entry.version == 1:
-        hass.config_entries.async_update_entry(
-            entry,
-            version=2,
-            data={
-                **entry.data,
-                CONF_CENTRE_ID: DEFAULT_CENTRE,
-                "legacy_auth": True,
-            },
-        )
     return True

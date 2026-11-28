@@ -10,7 +10,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_register_admin_service
 
-from .api import ApiError, AuthenticationError, segment
+from .api import ApiError, AuthenticationError, Conflict, Rejected, segment
 from .const import DOMAIN
 
 ENTRY = {vol.Required("config_entry_id"): cv.string}
@@ -141,6 +141,8 @@ def async_register_services(hass):
         except AuthenticationError as err:
             entry.async_start_reauth(hass)
             raise HomeAssistantError("API key rejected") from err
+        except (Conflict, Rejected) as err:
+            raise ServiceValidationError(str(err)) from err
         except ApiError as err:
             raise HomeAssistantError(str(err)) from err
         # Once accepted, return the receipt even when the next poll fails.

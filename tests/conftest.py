@@ -19,6 +19,7 @@ RAW = {
     "planRevision": 7,
     "sampledAt": "2026-11-27T12:00:00Z",
     "status": "ready",
+    "lotCodes": {"00000000-0000-4000-8000-000000000101": "A"},
     "locations": [
         {
             "id": "cam-1",
@@ -35,19 +36,28 @@ RAW = {
             "status": "compatible",
             "ideal": LIMITS,
             "automatic": LIMITS,
+            "automaticId": "automatic:6",
+            "automaticDeviations": None,
+            "automaticOrigin": {
+                "startsAt": 1795777100000,
+                "replacesId": None,
+                "actor": {"type": "user", "userId": "operator"},
+                "confirmationCommandId": "00000000-0000-4000-8000-000000000122",
+            },
             "effective": LIMITS,
             "manual": None,
             "proposal": {
                 "id": "proposal:7",
                 "contextKey": "context:7",
                 "limits": LIMITS,
+                "deviations": None,
                 "createdAt": 1795777200000,
                 "dueAt": 1795777500000,
                 "overdue": True,
             },
             "occupants": [
                 {
-                    "lotId": "lot-1",
+                    "lotId": "00000000-0000-4000-8000-000000000101",
                     "quantity": 45,
                     "age": 3,
                     "baseVersionId": None,
@@ -61,9 +71,20 @@ RAW = {
     "tasks": [
         {
             "id": "task:1",
-            "lotId": "lot-1",
+            "lotId": "00000000-0000-4000-8000-000000000101",
+            "assignmentId": "00000000-0000-4000-8000-000000000102",
+            "versionId": "00000000-0000-4000-8000-000000000103",
+            "privateRevisionId": "00000000-0000-4000-8000-000000000104",
             "revision": 3,
             "dueAt": 1795777200000,
+            "createdAt": 1795777100000,
+            "dueRecordedAt": 1795777200000,
+            "completedAt": None,
+            "completedBy": None,
+            "result": None,
+            "cancelledAt": None,
+            "cancellationReason": None,
+            "replacementId": None,
             "status": "due",
             "step": {
                 "kind": "curing_review",
@@ -102,6 +123,16 @@ def stream_manifest():
 @pytest.fixture
 def raw():
     return deepcopy(RAW)
+
+
+@pytest.fixture
+def receipt():
+    return {
+        "commandId": "00000000-0000-4000-8000-000000000123",
+        "stream": f"ProductionCentre/{DEFAULT_CENTRE}",
+        "eventId": "production-fact:confirmed",
+        "version": 8,
+    }
 
 
 @pytest.fixture

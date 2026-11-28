@@ -1,4 +1,4 @@
-"""Configuration and native Better Auth keys, including legacy upgrade."""
+"""Current configuration entries and native Better Auth credentials."""
 
 from hashlib import sha256
 from unittest.mock import patch
@@ -6,7 +6,6 @@ from unittest.mock import patch
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.registros_camaras import async_migrate_entry
 from custom_components.registros_camaras.api import (
     AuthenticationError,
     CannotConnect,
@@ -64,36 +63,61 @@ async def test_server_without_sensor_stream_is_rejected_during_configuration(
     assert result["errors"] == {"base": "incompatible_api"}
 
 
-async def test_reauth_and_legacy_migration(hass, client):
+async def test_unsupported_config_entry_is_not_adopted(hass, client):
     entry = MockConfigEntry(
         domain=DOMAIN,
         version=1,
-        unique_id="legacy-account",
-        data={"url": "https://old.example", "api_key": "old-key"},
+        unique_id="unsupported-entry",
+        data={"url": "https://registros.example", "api_key": "test-key"},
     )
     entry.add_to_hass(hass)
-    assert await async_migrate_entry(hass, entry)
-    assert entry.version == 2 and entry.data["legacy_auth"]
+    original = dict(entry.data)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is config_entries.ConfigEntryState.MIGRATION_ERROR
+    assert entry.version == 1 and entry.data == original
+    client.assert_not_called()
+
+
+async def test_reauth_replaces_current_credentials_and_drops_unknown_settings(hass, entry, client):
+    hass.config_entries.async_update_entry(entry, data={**entry.data, "unused_setting": "discard"})
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": config_entries.SOURCE_REAUTH, "entry_id": entry.entry_id},
         data=entry.data,
     )
+    assert {key.schema for key in result["data_schema"].schema} == {"api_key"}
     with patch("custom_components.registros_camaras.async_setup_entry", return_value=True):
         result = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {
-                "url": "https://new.example",
-                "api_key": "new-native-key",
-                "centre_id": "another-centre",
-            },
+            result["flow_id"], {"api_key": "  new-native-key  "}
         )
         assert result["type"] is FlowResultType.ABORT
         assert result["reason"] == "reauth_successful"
-        assert entry.data["url"] == "https://new.example"
-        assert entry.data.get("legacy_auth") is not True
-        assert entry.data["centre_id"] == "another-centre"
-        assert entry.unique_id == sha256(b"https://new.example|another-centre").hexdigest()
+        assert entry.data == {
+            "url": "https://registros.example",
+            "api_key": "new-native-key",
+            "centre_id": DEFAULT_CENTRE,
+        }
+        assert (
+            entry.unique_id
+            == sha256(f"https://registros.example|{DEFAULT_CENTRE}".encode()).hexdigest()
+        )
+        await hass.async_block_till_done()
+
+
+async def test_reconfigure_preserves_key_and_replaces_data(hass, entry, client):
+    hass.config_entries.async_update_entry(entry, data={**entry.data, "unused_setting": "discard"})
+    with patch("custom_components.registros_camaras.async_setup_entry", return_value=True):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": "reconfigure", "entry_id": entry.entry_id},
+            data={"url": "https://new.example/", "api_key": "  "},
+        )
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data == {
+            "url": "https://new.example",
+            "api_key": "test-key",
+            "centre_id": DEFAULT_CENTRE,
+        }
         await hass.async_block_till_done()
 
 

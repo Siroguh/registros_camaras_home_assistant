@@ -46,14 +46,17 @@ class CameraSensor(RegistrosEntity, SensorEntity):
             self._attr_options = ["empty", "no_plan", "no_phase", "compatible", "conflict"]
         elif key == "manual_end":
             self._attr_device_class = SensorDeviceClass.TIMESTAMP
+        elif key == "setpoint_source":
+            self._attr_device_class = SensorDeviceClass.ENUM
+            self._attr_options = ["manual", "automatic", "none"]
 
     @property
     def native_value(self):
         chamber = self.chamber
         if self.key == "quantity":
-            return sum(o["quantity"] for o in chamber.get("occupants", []))
+            return sum(o["quantity"] for o in chamber["occupants"])
         if self.key == "lots":
-            return len(chamber.get("occupants", []))
+            return len(chamber["occupants"])
         if self.key == "plan_status":
             return chamber["status"]
         if self.key == "proposal":
@@ -75,7 +78,7 @@ class CameraSensor(RegistrosEntity, SensorEntity):
     def extra_state_attributes(self):
         attrs = super().extra_state_attributes
         if self.key == "lots":
-            attrs["occupants"] = self.chamber.get("occupants", [])
+            attrs["occupants"] = self.chamber["occupants"]
         if self.key == "proposal":
             attrs["proposal"] = self.chamber["proposal"]
         return attrs
