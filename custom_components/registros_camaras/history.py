@@ -3,6 +3,10 @@
 HA 2026.10.3's public get_significant_states has no row limit; the alternative
 state_changes_during_period(limit=...) drops attribute-only reports. Isolate the
 native history builders here, adding only a row cap and deterministic tie order.
+The native metadata_id/last_updated_ts range query seeks retained rows directly;
+an exhausted page proves the rest of the requested interval empty. Recovery can
+therefore start at historyFrom=0 without iterating empty time windows. Each pass
+materializes at most PAGE_REPORTS + 1 rows, independent of the interval's age.
 There is no database connection, SQL text, or schema maintained by this adapter.
 Keep real-Recorder compatibility tests when updating the minimum HA version.
 """
@@ -50,7 +54,7 @@ def recorder_boundary(millis: int) -> float:
 
 
 def read_page(hass: HomeAssistant, entity_id: str, start: int, end: int) -> HistoryPage:
-    """Read one bounded page, never split a millisecond/coincident occurrence group."""
+    """Read bounded actual history, including empty gaps, without splitting a millisecond."""
     from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.db_schema import States
     from homeassistant.components.recorder.history import (

@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+import hashlib
 import math
 from unittest.mock import AsyncMock, patch
 
@@ -48,10 +49,21 @@ ASSIGNMENT = {
 }
 
 
+def manifest(assignments=None):
+    return {
+        "apiVersion": 1,
+        "revision": 1,
+        "maxBatchSize": 100,
+        "maxBatchDelayMillis": 2000,
+        "assignments": [ASSIGNMENT] if assignments is None else assignments,
+    }
+
+
 def sample(n=0):
     return {
         "assignmentId": ASSIGNMENT["id"],
-        "sourceEventId": f"2026-11-28T00:00:00.{n:06d}+00:00",
+        "sourceEventId": f"2026-11-28T00:00:00.{n:06d}+00:00:change:"
+        + hashlib.sha256(b"20").hexdigest(),
         "observedAt": 1795824000000,
         "mode": "live",
         "value": 20,
@@ -168,13 +180,19 @@ async def test_missing_index_preserves_segments_for_recovery(hass, real_storage,
     assert await restored.next_batch("centre") == batch
 
 
-async def test_repeated_empty_queues_keep_store_keys_and_cache_writes_bounded(hass, real_storage):
+async def test_repeated_empty_queues_keep_store_keys_and_cache_writes_bounded(
+    hass, entry, raw, real_storage
+):
     from homeassistant.helpers.storage import get_internal_store_manager
 
-    spool = UpdateStore(hass, "repeated-drain")
-    await spool.initialize()
-    snapshot = {"tasks": [{"id": str(n), "description": "x" * 300} for n in range(1500)]}
-    await spool.cache(snapshot=snapshot, manifest={"assignments": [ASSIGNMENT]})
+    updates = Updates(hass, entry, AsyncMock())
+    await updates.prepare()
+    spool = updates.spool
+    snapshot = {
+        **raw,
+        "tasks": [{**raw["tasks"][0], "id": str(n), "description": "x" * 300} for n in range(1500)],
+    }
+    await spool.cache(snapshot=snapshot, manifest=manifest())
     manager = get_internal_store_manager(hass)
     before = set(manager._invalidated)
     sizes = []
@@ -194,45 +212,10 @@ async def test_repeated_empty_queues_keep_store_keys_and_cache_writes_bounded(ha
     assert max(sizes) < 4000
     assert sum(sizes) < 400_000
     assert not spool.segments
-    restored = UpdateStore(hass, "repeated-drain")
+    restored = UpdateStore(hass, entry.entry_id)
     await restored.initialize()
     assert restored.data["snapshot"] == snapshot
     assert await restored.size() == 0
-
-
-async def test_legacy_segments_and_inline_cache_upgrade_atomically(hass, real_storage):
-    from homeassistant.exceptions import HomeAssistantError
-    from homeassistant.util.file import WriteError
-
-    spool = UpdateStore(hass, "legacy-segments")
-    legacy_key = f"{spool.key}.segment.old"
-    await spool.make_store(legacy_key).async_save([[ASSIGNMENT["source"], sample()]])
-    await spool.store.async_save(
-        {
-            "segments": [{"key": legacy_key, "start": 0}],
-            "batch": None,
-            "cursors": {},
-            "snapshot": {"revision": 1},
-            "manifest": {"assignments": [ASSIGNMENT]},
-        }
-    )
-    await spool.initialize()
-    assert spool.data["snapshot"] == {"revision": 1}
-    with patch.object(spool.store, "_async_write_data", side_effect=WriteError("disk failed")):
-        with pytest.raises(HomeAssistantError, match="not persisted"):
-            await spool.cache(snapshot={"revision": 2})
-    restored = UpdateStore(hass, "legacy-segments")
-    await restored.initialize()
-    assert restored.data["snapshot"] == {"revision": 1}
-    assert await restored.size() == 1
-    await restored.cache(snapshot={"revision": 2})
-    metadata = await restored.store.async_load()
-    assert "snapshot" not in metadata
-    assert metadata["cache_key"]
-    reopened = UpdateStore(hass, "legacy-segments")
-    await reopened.initialize()
-    assert reopened.data["snapshot"] == {"revision": 2}
-    assert (await reopened.next_batch("centre"))["readings"] == [sample()]
 
 
 async def test_real_ha_changed_and_identical_reports_are_copied_without_coalescing(hass, entry):
@@ -272,9 +255,9 @@ async def test_batch_ack_is_verified_before_local_removal():
         new=AsyncMock(
             return_value={
                 "commandId": "batch-id",
-                "stream": "ReadingIngestion/batch-id",
-                "eventId": "ReadingIngestion/batch-id:1",
-                "version": 1,
+                "stream": "ReadingTransaction/batch-id",
+                "eventId": "ReadingTransaction/batch-id:4",
+                "version": 4,
             }
         ),
     ):
@@ -304,9 +287,9 @@ async def test_stream_and_push_use_real_http_contract(aiohttp_client, socket_ena
         return web.json_response(
             {
                 "commandId": command_id,
-                "stream": f"ReadingIngestion/{command_id}",
-                "eventId": f"ReadingIngestion/{command_id}:1",
-                "version": 1,
+                "stream": f"ReadingTransaction/{command_id}",
+                "eventId": f"ReadingTransaction/{command_id}:4",
+                "version": 4,
             }
         )
 
@@ -441,8 +424,9 @@ async def test_restart_drains_shutdown_reserve_before_resubscribing(
 ):
     hass.config.external_url = ASSIGNMENT["source"]
     stream_manifest.return_value["assignments"] = [ASSIGNMENT]
-    store = UpdateStore(hass, entry.entry_id)
-    await store.initialize()
+    prepared = Updates(hass, entry, AsyncMock())
+    await prepared.prepare()
+    store = prepared.spool
     await store.append([(ASSIGNMENT["source"], sample(n)) for n in range(3)])
     with patch("custom_components.registros_camaras.updates.MAX_REPORTS", 2):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -702,12 +686,12 @@ async def test_manifest_removes_last_local_subscription(hass, entry):
     client = AsyncMock()
     updates = Updates(hass, entry, client)
     await updates.prepare()
-    client.sensor_stream.return_value = {"assignments": [ASSIGNMENT]}
+    client.sensor_stream.return_value = manifest()
     await updates.refresh()
     assert updates.unsubscribers
-    client.sensor_stream.return_value = {
-        "assignments": [{**ASSIGNMENT, "source": "https://other.example"}]
-    }
+    client.sensor_stream.return_value = manifest(
+        [{**ASSIGNMENT, "source": "https://other.example"}]
+    )
     await updates.refresh()
     assert updates.assignments == []
     assert updates.unsubscribers == []
@@ -758,13 +742,19 @@ async def test_offline_restart_captures_equal_reports_then_delivers(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_full_queue_drain_has_bounded_write_volume_and_restarts(hass, real_storage):
+async def test_full_queue_drain_has_bounded_write_volume_and_restarts(
+    hass, entry, raw, real_storage
+):
     from homeassistant.helpers.storage import Store
 
-    spool = UpdateStore(hass, "full-queue")
-    await spool.initialize()
-    snapshot = {"tasks": [{"id": str(n), "description": "x" * 300} for n in range(1500)]}
-    await spool.cache(snapshot=snapshot, manifest={"assignments": [ASSIGNMENT]})
+    updates = Updates(hass, entry, AsyncMock())
+    await updates.prepare()
+    spool = updates.spool
+    snapshot = {
+        **raw,
+        "tasks": [{**raw["tasks"][0], "id": str(n), "description": "x" * 300} for n in range(1500)],
+    }
+    await spool.cache(snapshot=snapshot, manifest=manifest())
     sizes = []
     original = Store._write_prepared_data
 
@@ -779,7 +769,7 @@ async def test_full_queue_drain_has_bounded_write_volume_and_restarts(hass, real
         count = 0
         while batch := await spool.next_batch("centre"):
             if count == 0:
-                spool = UpdateStore(hass, "full-queue")
+                spool = UpdateStore(hass, entry.entry_id)
                 await spool.initialize()
                 assert spool.data["snapshot"] == snapshot
                 assert await spool.next_batch("centre") == batch
@@ -997,6 +987,7 @@ async def test_real_recorder_dequeued_event_waits_for_commit_barrier(
 
 
 @pytest.mark.parametrize("history_first", [False, True])
+@pytest.mark.parametrize("live_unit", ["°C", ""])
 async def test_real_recorder_missing_unit_preserves_live_payload_and_cursor(
     recorder_db_url,
     hass,
@@ -1005,6 +996,7 @@ async def test_real_recorder_missing_unit_preserves_live_payload_and_cursor(
     tmp_path,
     real_storage,
     history_first,
+    live_unit,
 ):
     await async_setup_recorder_instance(
         hass,
@@ -1020,7 +1012,7 @@ async def test_real_recorder_missing_unit_preserves_live_payload_and_cursor(
     at = datetime.now(UTC)
     try:
         hass.states.async_set(
-            ASSIGNMENT["entityId"], "20", {"unit_of_measurement": "°C", "large": "x" * 17000}
+            ASSIGNMENT["entityId"], "20", {"unit_of_measurement": live_unit, "large": "x" * 17000}
         )
         await hass.async_block_till_done()
         live = list(updates.pending)
@@ -1047,11 +1039,15 @@ async def test_real_recorder_missing_unit_preserves_live_payload_and_cursor(
         assert await restored.cursor(ASSIGNMENT["id"], 0) == int(
             (at + timedelta(seconds=10)).timestamp() * 1000
         )
+        await restored.acknowledge(batch["commandId"])
+        reopened = UpdateStore(hass, entry.entry_id)
+        await reopened.initialize()
+        assert await reopened.next_batch("centre") is None
+        assert await reopened.size() == 0
     finally:
         updates.unsubscribe()
 
 
-@pytest.mark.parametrize("restored_limit", [1, 2])
 async def test_real_recorder_incomplete_reserve_never_pauses_live_capture(
     recorder_db_url,
     hass,
@@ -1061,7 +1057,6 @@ async def test_real_recorder_incomplete_reserve_never_pauses_live_capture(
     real_storage,
     client,
     stream_manifest,
-    restored_limit,
 ):
     await async_setup_recorder_instance(
         hass,
@@ -1073,7 +1068,7 @@ async def test_real_recorder_incomplete_reserve_never_pauses_live_capture(
     hass.config.external_url = ASSIGNMENT["source"]
     stream_manifest.return_value["assignments"] = [ASSIGNMENT]
     updates = Updates(hass, entry, AsyncMock())
-    await updates.spool.initialize()
+    await updates.prepare()
     updates.assignments = [ASSIGNMENT]
     at = datetime.now(UTC)
     for offset, value in [(20, "20"), (19, "21")]:
@@ -1101,7 +1096,7 @@ async def test_real_recorder_incomplete_reserve_never_pauses_live_capture(
     with (
         patch(
             "custom_components.registros_camaras.update_store.MAX_INCOMPLETE_REPORTS",
-            restored_limit,
+            2,
         ),
         patch("custom_components.registros_camaras.updates.datetime") as clock,
     ):
@@ -1129,7 +1124,7 @@ async def test_real_recorder_incomplete_reserve_never_pauses_live_capture(
         patch("custom_components.registros_camaras.update_store.MAX_REPORTS", 2),
         patch(
             "custom_components.registros_camaras.update_store.MAX_INCOMPLETE_REPORTS",
-            restored_limit,
+            2,
         ),
         patch.object(Updates, "wait", wait),
         patch.object(RegistrosClient, "push_updates", side_effect=push),
@@ -1258,35 +1253,6 @@ async def test_definitively_rejected_mapping_retains_batch_and_delivers_healthy_
         await restored.acknowledge(frozen["commandId"])
     await restored.append([(ASSIGNMENT["source"], healthy)])
     assert (await restored.next_batch("centre"))["readings"] == [healthy]
-
-
-async def test_legacy_mixed_rejected_batch_stays_whole_without_reidentifying_rows(
-    hass, real_storage
-):
-    spool = UpdateStore(hass, "legacy-mixed")
-    await spool.initialize()
-    good = {**sample(1), "assignmentId": "healthy"}
-    await spool.append([(ASSIGNMENT["source"], sample()), (ASSIGNMENT["source"], good)])
-    frozen = {
-        "apiVersion": 1,
-        "commandId": "legacy-frozen",
-        "centreId": "centre",
-        "source": ASSIGNMENT["source"],
-        "readings": [sample(), good],
-    }
-    await spool.save({**spool.data, "batch": frozen})
-    await spool.block(frozen["commandId"], "assignment_window")
-    restored = UpdateStore(hass, "legacy-mixed")
-    await restored.initialize()
-    assert await restored.size() == 2
-    assert await restored.next_batch("centre") is None
-    assert list(restored.blocked_batches.values()) == [frozen]
-    # Recorder overlap must not requeue either frozen reading under a new command.
-    await restored.append([(ASSIGNMENT["source"], {**good, "mode": "history"})])
-    assert await restored.next_batch("centre") is None
-    newer = {**sample(2), "assignmentId": "healthy"}
-    await restored.append([(ASSIGNMENT["source"], newer)])
-    assert (await restored.next_batch("centre"))["readings"] == [newer]
 
 
 @pytest.mark.parametrize("failure", ["batch", "index"])
@@ -1673,37 +1639,21 @@ async def test_real_storage_full_queue_retries_cache_without_starvation(
     assert updates.snapshot_timer is None
 
 
-async def test_queue_v1_migration_preserves_frozen_batch_and_rejects_unsafe_downgrade(
-    hass, real_storage
-):
-    from homeassistant.helpers.storage import UnsupportedStorageVersionError
+@pytest.mark.parametrize("version", [1, 3])
+async def test_unsupported_store_version_is_rejected_without_rewriting(hass, real_storage, version):
+    from pathlib import Path
 
-    spool = UpdateStore(hass, "v1-migration")
-    old = Store(hass, 1, spool.key, private=True, atomic_writes=True)
-    frozen = {
-        "apiVersion": 1,
-        "commandId": "pre-upgrade-command",
-        "centreId": "centre",
-        "source": ASSIGNMENT["source"],
-        "readings": [sample()],
-    }
-    await old.async_save(
-        {
-            "rows": [[ASSIGNMENT["source"], sample()]],
-            "batch": frozen,
-            "cursors": {ASSIGNMENT["id"]: 123},
-        }
+    from homeassistant.exceptions import HomeAssistantError
+
+    spool = UpdateStore(hass, "unsupported-version")
+    await Store(hass, version, spool.key, private=True, atomic_writes=True).async_save(
+        {"rows": [[ASSIGNMENT["source"], sample()]], "batch": None, "cursors": {}}
     )
-    await spool.initialize()
-    assert await spool.next_batch("centre") == frozen
-    assert await spool.cursor(ASSIGNMENT["id"], 0) == 123
-    await spool.block(frozen["commandId"], "assignment_window")
-    restored = UpdateStore(hass, "v1-migration")
-    await restored.initialize()
-    assert await restored.next_batch("centre") is None
-    assert list(restored.blocked_batches.values()) == [frozen]
-    with pytest.raises(UnsupportedStorageVersionError):
-        await Store(hass, 1, spool.key).async_load()
+    path = Path(spool.store.path)
+    before = await hass.async_add_executor_job(path.read_bytes)
+    with pytest.raises(HomeAssistantError):
+        await spool.initialize()
+    assert await hass.async_add_executor_job(path.read_bytes) == before
 
 
 @pytest.mark.parametrize("lookahead", [False, True])
@@ -1904,23 +1854,15 @@ async def test_initial_cache_write_failure_remains_setup_retry_and_recovers(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-async def test_interleaved_assignment_ack_write_volume(hass, real_storage, legacy):
+async def test_interleaved_assignment_ack_write_volume(hass, real_storage):
     from pathlib import Path
 
-    spool = UpdateStore(hass, f"interleaved-{legacy}")
+    spool = UpdateStore(hass, "interleaved")
     await spool.initialize()
     rows = [
         [ASSIGNMENT["source"], {**sample(n), "assignmentId": f"assignment-{n % 36}"}]
         for n in range(3600)
     ]
-    frozen = {
-        "apiVersion": 1,
-        "commandId": "legacy-mixed",
-        "centreId": "centre",
-        "source": ASSIGNMENT["source"],
-        "readings": [row for _, row in rows[:100]],
-    }
     writes = []
     original = Store._async_write_data
 
@@ -1930,22 +1872,12 @@ async def test_interleaved_assignment_ack_write_volume(hass, real_storage, legac
         writes.append(("/segment." in store.key, size))
 
     with patch.object(Store, "_async_write_data", measure):
-        if legacy:
-            descriptors = []
-            for offset in range(0, len(rows), 1000):
-                key = f"{spool.key}.files/segment.legacy-{offset}"
-                await spool.make_store(key).async_save(rows[offset : offset + 1000])
-                descriptors.append({"key": key, "start": 0})
-            await spool.store.async_save({**spool.data, "segments": descriptors, "batch": frozen})
-        else:
-            await spool.append(rows)
+        await spool.append(rows)
         enqueue = sum(size for segment, size in writes if segment)
         enqueue_writes = sum(segment for segment, _ in writes)
         writes.clear()
         spool = UpdateStore(hass, spool.key.removeprefix("registros_camaras.updates."))
         await spool.initialize()
-        if legacy:
-            assert await spool.next_batch("centre") == frozen
         delivered = []
         while batch := await spool.next_batch("centre"):
             delivered.extend(batch["readings"])
@@ -1953,7 +1885,7 @@ async def test_interleaved_assignment_ack_write_volume(hass, real_storage, legac
         ack_bytes = sum(size for segment, size in writes if segment)
         ack_writes = sum(segment for segment, _ in writes)
         print(
-            f"interleaved legacy={legacy}: enqueue_segment_bytes={enqueue} "
+            f"interleaved: enqueue_segment_bytes={enqueue} "
             f"writes={enqueue_writes}; "
             f"drain_segment_bytes={ack_bytes} writes={ack_writes}; "
             f"drain_all_bytes={sum(size for _, size in writes)}"
@@ -1962,77 +1894,388 @@ async def test_interleaved_assignment_ack_write_volume(hass, real_storage, legac
             [row for _, row in rows], key=lambda row: row["sourceEventId"]
         )
         assert await spool.size() == 0
-        assert ack_bytes <= enqueue if legacy else ack_bytes == 0
-        assert ack_writes <= 36 if legacy else ack_writes == 0
+        assert ack_bytes == 0
+        assert ack_writes == 0
+
+
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("from_epoch", [False, True])
+async def test_real_recorder_fresh_manifest_backfills_retained_days_without_empty_windows(
+    recorder_db_url,
+    hass,
+    entry,
+    async_setup_recorder_instance,
+    tmp_path,
+    real_storage,
+    closed,
+    from_epoch,
+):
+    from custom_components.registros_camaras.history import read_page
+
+    recorder = await async_setup_recorder_instance(
+        hass, {"db_url": f"sqlite:///{tmp_path / 'recorder.db'}", "commit_interval": 60}
+    )
+    now = datetime.now(UTC).replace(microsecond=0)
+    originals = []
+    # Real Recorder retains sparse rows well before this integration's first startup.
+    # The last row is inside the settlement margin and must remain pending.
+    for age, value in [
+        (timedelta(days=7), 17),
+        (timedelta(days=2), 20),
+        (timedelta(hours=3), 23),
+        (timedelta(seconds=5), 25),
+    ]:
+        with patch("homeassistant.core.time.time", return_value=(now - age).timestamp()):
+            hass.states.async_set(ASSIGNMENT["entityId"], str(value), {"unit_of_measurement": "°C"})
+            await hass.async_block_till_done()
+            originals.append(hass.states.get(ASSIGNMENT["entityId"]))
+    await recorder.async_block_till_done()
+    assignment = {
+        **ASSIGNMENT,
+        "historyFrom": 0 if from_epoch else int((now - timedelta(days=3)).timestamp() * 1000),
+        "endsAt": int((now - timedelta(days=1)).timestamp() * 1000) if closed else None,
+    }
+    absent = {**assignment, "id": "absent", "entityId": "sensor.never_recorded"}
+    hass.config.external_url = ASSIGNMENT["source"]
+    updates = Updates(hass, entry, AsyncMock())
+    await updates.prepare()
+    await updates.apply_manifest(manifest([assignment, absent]))
+    assert await updates.spool.cursor(assignment["id"], -1) == assignment["historyFrom"]
+    expected_end = assignment["endsAt"] if closed else int(now.timestamp() * 1000) - 10000
+    expected = [
+        reading(assignment, state, state.last_updated, "history")
+        for state in originals
+        if assignment["historyFrom"] <= int(state.last_updated.timestamp() * 1000) < expected_end
+    ]
+    try:
+        with (
+            patch("custom_components.registros_camaras.history.PAGE_REPORTS", 2),
+            patch(
+                "custom_components.registros_camaras.updates.read_page", wraps=read_page
+            ) as query,
+            patch("custom_components.registros_camaras.updates.datetime") as clock,
+        ):
+            clock.now.return_value = now
+            for _ in range(3):
+                more = await updates.recover()
+                restored = UpdateStore(hass, entry.entry_id)
+                await restored.initialize()
+                updates.spool = restored
+                if not more:
+                    break
+            assert not more
+            assert (
+                query.call_count <= 3
+            )  # Two actual pages + one empty entity, never epoch windows.
+            assert query.call_args_list[0].args[2] == assignment["historyFrom"]
+        batch = await updates.spool.next_batch("centre")
+        assert batch["readings"] == expected
+        assert expected and all(row["mode"] == "history" for row in expected)
+        for item in (assignment, absent):
+            assert await updates.spool.cursor(item["id"], -1) == expected_end
+        await updates.spool.acknowledge(batch["commandId"])
+        # Applying a refreshed manifest or restarting never silently rewinds an existing cursor.
+        await updates.apply_manifest(manifest([assignment, absent]))
+        with patch("custom_components.registros_camaras.updates.datetime") as clock:
+            clock.now.return_value = now
+            assert not await updates.recover()
+        assert await updates.spool.size() == 0
+        restored = UpdateStore(hass, entry.entry_id)
+        await restored.initialize()
+        assert await restored.next_batch("centre") is None
+        assert await restored.cursor(assignment["id"], -1) == expected_end
+    finally:
+        updates.unsubscribe()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "inline_rows",
+        "inline_cache",
+        "unknown_metadata",
+        "root_segment",
+        "mixed_segment",
+        "duplicate_segment",
+        "duplicate_report",
+        "negative_cursor",
+        "boolean_cursor",
+        "fractional_cursor",
+        "offset",
+        "empty_segment",
+        "invalid_row",
+        "changed_batch",
+        "mixed_batch",
+        "blocked_payload",
+        "missing_blocked",
+        "unsafe_key",
+        "incomplete_capacity",
+    ],
+)
+async def test_current_restore_rejects_unsupported_layout_and_inconsistent_files(
+    hass, real_storage, damage
+):
+    from copy import deepcopy
+    from pathlib import Path
+    from uuid import uuid4
+
+    from homeassistant.exceptions import HomeAssistantError
+
+    spool = UpdateStore(hass, "strict-restore")
+    await spool.initialize()
+    await spool.append([(ASSIGNMENT["source"], sample())])
+    batch = await spool.next_batch("centre")
+    if damage in {"blocked_payload", "missing_blocked"}:
+        await spool.block(batch["commandId"], "assignment_window")
+    metadata = await spool.store.async_load()
+    descriptor = metadata["segments"][0]
+    segment = spool.make_store(descriptor["key"])
+    rows = await segment.async_load()
+    if damage == "inline_rows":
+        metadata.pop("segments")
+        metadata["rows"] = rows
+    elif damage == "inline_cache":
+        metadata["manifest"] = manifest()
+    elif damage == "unknown_metadata":
+        metadata["future_state"] = {"preserve": True}
+    elif damage == "root_segment":
+        descriptor["key"] = f"{spool.key}.segment.{uuid4()}"
+    elif damage == "mixed_segment":
+        rows.append([ASSIGNMENT["source"], {**sample(1), "assignmentId": "other"}])
+    elif damage == "duplicate_segment":
+        metadata["segments"].append(deepcopy(descriptor))
+    elif damage == "duplicate_report":
+        rows.append(deepcopy(rows[0]))
+    elif damage == "negative_cursor":
+        metadata["cursors"][ASSIGNMENT["id"]] = -1
+    elif damage == "boolean_cursor":
+        metadata["cursors"][ASSIGNMENT["id"]] = True
+    elif damage == "fractional_cursor":
+        metadata["cursors"][ASSIGNMENT["id"]] = 1.5
+    elif damage == "offset":
+        descriptor["start"] = len(rows)
+    elif damage == "empty_segment":
+        rows.clear()
+    elif damage == "invalid_row":
+        rows[0][1]["value"] = None
+    elif damage == "changed_batch":
+        metadata["batch"]["readings"][0]["value"] = 99
+    elif damage == "mixed_batch":
+        other = {**sample(1), "assignmentId": "other"}
+        other_key = f"{spool.key}.files/segment.{uuid4()}"
+        await spool.make_store(other_key).async_save([[ASSIGNMENT["source"], other]])
+        metadata["segments"].append({"key": other_key, "start": 0})
+        metadata["batch"]["readings"].append(other)
+    elif damage == "blocked_payload":
+        blocked = spool.make_store(metadata["blocked"][0]["key"])
+        frozen = await blocked.async_load()
+        frozen["readings"][0]["value"] = 99
+        await blocked.async_save(frozen)
+    elif damage == "missing_blocked":
+        await spool.make_store(metadata["blocked"][0]["key"]).async_remove()
+    elif damage == "unsafe_key":
+        metadata["cache_key"] = "../another-integration"
+    elif damage == "incomplete_capacity":
+        rows = [
+            [ASSIGNMENT["source"], {**sample(n), "mode": "history", "unit": ""}] for n in range(3)
+        ]
+        metadata["batch"] = None
+    await segment.async_save(rows)
+    await spool.store.async_save(metadata)
+    # A failure must precede garbage collection and leave every current file intact.
+    orphan = spool.make_store(f"{spool.key}.files/segment.{uuid4()}")
+    await orphan.async_save([[ASSIGNMENT["source"], sample(9)]])
+    index = Path(spool.store.path)
+    before = await hass.async_add_executor_job(index.read_bytes)
+    with patch("custom_components.registros_camaras.update_store.MAX_INCOMPLETE_REPORTS", 2):
+        with pytest.raises(HomeAssistantError, match="Invalid stored"):
+            await UpdateStore(hass, "strict-restore").initialize()
+    assert await hass.async_add_executor_job(index.read_bytes) == before
+    assert await orphan.async_load() is not None
+
+
+@pytest.mark.parametrize("content", ["batch", "cursor", "cache"])
+async def test_nonempty_unbound_destination_is_rejected(hass, real_storage, content):
+    from homeassistant.exceptions import HomeAssistantError
+
+    spool = UpdateStore(hass, "unbound")
+    await spool.initialize()
+    frozen = None
+    if content == "batch":
+        await spool.append([(ASSIGNMENT["source"], sample())])
+        frozen = await spool.next_batch("centre")
+    elif content == "cursor":
+        await spool.ensure_cursor(ASSIGNMENT["id"], 100)
+    else:
+        await spool.cache(manifest=manifest())
+    with pytest.raises(HomeAssistantError, match="no destination"):
+        await spool.bind("a" * 64)
+    restored = UpdateStore(hass, "unbound")
+    await restored.initialize()
+    assert await restored.next_batch("centre") == frozen
+    assert "destination" not in restored.data
+
+
+async def test_invalid_rebuildable_manifest_cache_cannot_replace_queue(hass, real_storage):
+    spool = UpdateStore(hass, "bad-cache")
+    await spool.initialize()
+    await spool.append([(ASSIGNMENT["source"], sample())])
+    frozen = await spool.next_batch("centre")
+    await spool.cache(manifest={"assignments": [ASSIGNMENT]})
+    restored = UpdateStore(hass, "bad-cache")
+    await restored.initialize()
+    assert restored.cache_key is None
+    assert "manifest" not in restored.data
+    assert await restored.next_batch("centre") == frozen
+
+
+@pytest.mark.parametrize("damage", ["missing_locations", "wrong_centre", "not_object"])
+async def test_invalid_snapshot_cache_keeps_manifest_and_frozen_batch_through_offline_retry(
+    hass, entry, client, stream_manifest, real_storage, damage
+):
+    from copy import deepcopy
+
+    from homeassistant.config_entries import ConfigEntryState
+
+    hass.config.external_url = ASSIGNMENT["source"]
+    stream_manifest.return_value["assignments"] = [ASSIGNMENT]
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    updates = entry.runtime_data.updates
+    await updates.spool.append([(ASSIGNMENT["source"], sample())])
+    frozen = await updates.spool.next_batch(entry.data["centre_id"])
+    cursors = deepcopy(updates.spool.data["cursors"])
+    valid_manifest = deepcopy(updates.spool.data["manifest"])
+    valid_snapshot = deepcopy(updates.spool.data["snapshot"])
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    cache = updates.spool.make_store(updates.spool.cache_key)
+    corrupted = await cache.async_load()
+    if damage == "missing_locations":
+        del corrupted["snapshot"]["locations"]
+    elif damage == "wrong_centre":
+        corrupted["snapshot"]["centreId"] = "another-centre"
+        for location in corrupted["snapshot"]["locations"]:
+            location["centreId"] = "another-centre"
+    else:
+        corrupted["snapshot"] = []
+    await cache.async_save(corrupted)
+    client.side_effect = CannotConnect()
+    stream_manifest.side_effect = CannotConnect()
+    # Repeat failure to prove the valid manifest survives cleanup and another restore.
+    for _ in range(2):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        assert entry.state is ConfigEntryState.SETUP_RETRY
+        restored = UpdateStore(hass, entry.entry_id)
+        await restored.initialize()
+        assert "snapshot" not in restored.data
+        assert restored.data["manifest"] == valid_manifest
+        assert restored.data["cursors"] == cursors
+        assert await restored.next_batch(entry.data["centre_id"]) == frozen
+        assert await hass.config_entries.async_unload(entry.entry_id)
+    client.side_effect = None
+    stream_manifest.side_effect = None
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    recovered = entry.runtime_data.updates.spool
+    assert recovered.data["snapshot"] == valid_snapshot
+    assert recovered.data["manifest"] == valid_manifest
+    assert recovered.data["cursors"] == cursors
+    assert await recovered.next_batch(entry.data["centre_id"]) == frozen
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    restored = UpdateStore(hass, entry.entry_id)
+    await restored.initialize()
+    assert restored.data["snapshot"] == valid_snapshot
+    assert await restored.next_batch(entry.data["centre_id"]) == frozen
 
 
 @pytest.mark.parametrize("failure", ["segment", "index"])
-async def test_legacy_segment_repartition_failure_preserves_frozen_batch(
+async def test_missing_unit_live_promotion_write_failure_preserves_retry(
     hass, real_storage, failure
 ):
     from homeassistant.exceptions import HomeAssistantError
     from homeassistant.util.file import WriteError
 
-    entry_id = "legacy-repartition"
-    spool = UpdateStore(hass, entry_id)
-    rows = [
-        [ASSIGNMENT["source"], {**sample(n), "assignmentId": f"mapping-{n % 3}"}] for n in range(6)
-    ]
-    # A pure tail after a legacy mixed segment must not jump ahead on repartition.
-    rows.append([ASSIGNMENT["source"], {**sample(6), "assignmentId": "mapping-0"}])
-    frozen = {
-        "apiVersion": 1,
-        "commandId": "mixed-original",
-        "centreId": "centre",
-        "source": ASSIGNMENT["source"],
-        "readings": [row for _, row in rows],
-    }
-    key = f"{spool.key}.files/segment.legacy"
-    await spool.make_store(key).async_save(rows[:6])
-    tail_key = f"{spool.key}.files/segment.pure-tail"
-    await spool.make_store(tail_key).async_save(rows[6:])
-    await spool.store.async_save(
-        {
-            **spool.data,
-            "segments": [{"key": key, "start": 0}, {"key": tail_key, "start": 0}],
-            "batch": frozen,
-            "cursors": {"mapping-0": 123},
-        }
-    )
+    spool = UpdateStore(hass, "promotion-failure")
     await spool.initialize()
+    live = {**sample(), "unit": ""}
+    history = {**live, "mode": "history"}
+    await spool.append([(ASSIGNMENT["source"], history)], (ASSIGNMENT["id"], 100))
     original = Store._async_write_data
 
     async def fail(store, data):
-        if (failure == "index" and store.key == spool.key) or (
-            failure == "segment" and "/segment." in store.key
+        if (failure == "segment" and "/segment." in store.key) or (
+            failure == "index" and store.key == spool.key
         ):
-            raise WriteError("fixture migration failure")
+            raise WriteError("fixture promotion failure")
         await original(store, data)
 
     with patch.object(Store, "_async_write_data", fail):
         with pytest.raises(HomeAssistantError, match="not persisted"):
-            await spool.cache(snapshot={"revision": 7})
-    restored = UpdateStore(hass, entry_id)
+            await spool.append([(ASSIGNMENT["source"], live)])
+    restored = UpdateStore(hass, "promotion-failure")
     await restored.initialize()
-    assert restored.data["rows"] == rows
+    assert restored.data["rows"] == [[ASSIGNMENT["source"], history]]
+    assert await restored.cursor(ASSIGNMENT["id"], 0) == 100
+    assert await restored.next_batch("centre") is None
+    await restored.append([(ASSIGNMENT["source"], live)])
+    frozen = await restored.next_batch("centre")
+    assert frozen["readings"] == [live]
+    reopened = UpdateStore(hass, "promotion-failure")
+    await reopened.initialize()
+    assert await reopened.next_batch("centre") == frozen
+    await reopened.acknowledge(frozen["commandId"])
+    assert await reopened.size() == 0
+
+
+async def test_missing_unit_overlap_cannot_rewrite_frozen_history(hass, real_storage):
+    from homeassistant.exceptions import HomeAssistantError
+
+    spool = UpdateStore(hass, "frozen-history")
+    await spool.initialize()
+    history = {**sample(), "mode": "history", "unit": "", "status": "unavailable", "value": None}
+    await spool.append([(ASSIGNMENT["source"], history)])
+    frozen = await spool.next_batch("centre")
+    # Non-numeric history is already eligible; a later unit enrichment cannot
+    # alter the payload owned by its current frozen command.
+    with pytest.raises(HomeAssistantError, match="frozen"):
+        await spool.append([(ASSIGNMENT["source"], {**history, "mode": "live", "unit": "°C"})])
+    restored = UpdateStore(hass, "frozen-history")
+    await restored.initialize()
     assert await restored.next_batch("centre") == frozen
-    assert await restored.cursor("mapping-0", 0) == 123
-    await restored.cache(snapshot={"revision": 7})
-    migrated = UpdateStore(hass, entry_id)
-    await migrated.initialize()
-    assert await migrated.next_batch("centre") == frozen
-    assert sorted(migrated.data["rows"], key=lambda item: item[1]["sourceEventId"]) == rows
-    for assignment in {row["assignmentId"] for _, row in rows}:
-        assert [
-            item for item in migrated.data["rows"] if item[1]["assignmentId"] == assignment
-        ] == [item for item in rows if item[1]["assignmentId"] == assignment]
-    await migrated.block(frozen["commandId"], "assignment_window")
-    await migrated.append([(ASSIGNMENT["source"], sample(7))])
-    healthy = await migrated.next_batch("centre")
-    assert healthy["readings"] == [sample(7)]
-    await migrated.acknowledge(healthy["commandId"])
-    final = UpdateStore(hass, entry_id)
-    await final.initialize()
-    assert list(final.blocked_batches.values()) == [frozen]
-    assert await final.next_batch("centre") is None
-    assert await final.size() == 7
+    assert restored.data["rows"] == [[ASSIGNMENT["source"], history]]
+
+
+async def test_snapshot_cache_requires_matching_store_destination(hass, entry, raw, real_storage):
+    from homeassistant.exceptions import HomeAssistantError
+
+    updates = Updates(hass, entry, AsyncMock())
+    await updates.prepare()
+    spool = updates.spool
+    destination = spool.data["destination"]
+    await spool.append([(ASSIGNMENT["source"], sample())])
+    frozen = await spool.next_batch(entry.data["centre_id"])
+    await spool.cache(snapshot=raw, manifest=manifest())
+    metadata = await spool.store.async_load()
+    metadata["destination"] = "a" * 64
+    await spool.store.async_save(metadata)
+    restored = UpdateStore(hass, entry.entry_id)
+    await restored.initialize()
+    assert "snapshot" not in restored.data
+    assert restored.data["manifest"] == manifest()
+    assert await restored.next_batch(entry.data["centre_id"]) == frozen
+    with pytest.raises(HomeAssistantError, match="another destination"):
+        await restored.bind(destination)
+
+
+async def test_invalid_manifest_cache_retains_valid_bound_snapshot(hass, entry, raw, real_storage):
+    updates = Updates(hass, entry, AsyncMock())
+    await updates.prepare()
+    await updates.spool.cache(snapshot=raw, manifest={"assignments": [ASSIGNMENT]})
+    restored = UpdateStore(hass, entry.entry_id)
+    await restored.initialize()
+    assert "manifest" not in restored.data
+    assert restored.data["snapshot"] == raw
+    # A later verified write replaces only the invalid cache portion.
+    await restored.cache(manifest=manifest())
+    reopened = UpdateStore(hass, entry.entry_id)
+    await reopened.initialize()
+    assert reopened.data["snapshot"] == raw
+    assert reopened.data["manifest"] == manifest()

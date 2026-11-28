@@ -2,6 +2,10 @@
 
 ## Arquitectura
 
+- Este proyecto usa únicamente sus contratos y formatos actuales. No añadir
+  migraciones, adopciones ni fallbacks para datos o comportamientos retirados.
+  La recuperación del formato actual, la identidad de cada reporte y el ACK
+  durable siguen siendo requisitos obligatorios.
 - Seguir `custom-components/blueprint` y las APIs de la versión mínima declarada
   en `hacs.json`. La atribución de la plantilla está en `NOTICE`.
 - Configuración mediante config entry y flujos nativos; cliente HTTP con la sesión
@@ -27,7 +31,7 @@
   Esperar escrituras en curso y usar el ciclo `FINAL_WRITE` de HA al apagar.
   Conservar la reserva acotada para vaciar RAM cuando la cola esté llena.
 - Recorder es recuperación complementaria, no fuente de reportes idénticos que
-  no guardó. Consultar ventanas limitadas, excluir estados sintéticos y mantener
+  no guardó. Consultar páginas acotadas, excluir estados sintéticos y mantener
   el tiempo original y modo histórico.
 - Usar errores/diagnósticos seguros: no incluir claves, URL privada, cuerpos de
   respuesta ni datos de lotes. Validar contrato, ACK y redirecciones HTTP.

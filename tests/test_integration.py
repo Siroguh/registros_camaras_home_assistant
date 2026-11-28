@@ -3,10 +3,11 @@
 from copy import deepcopy
 from unittest.mock import AsyncMock, patch
 
+from aiohttp import web
 import pytest
 from pytest_homeassistant_custom_component.common import MockUser
 
-from custom_components.registros_camaras.api import CannotConnect, decode_snapshot
+from custom_components.registros_camaras.api import MOVEMENT_ERRORS, CannotConnect, decode_snapshot
 from custom_components.registros_camaras.const import DEFAULT_CENTRE, DOMAIN
 from custom_components.registros_camaras.diagnostics import async_get_config_entry_diagnostics
 from homeassistant.core import Context
@@ -64,7 +65,7 @@ async def test_entities_fail_closed_and_discover_new_chambers(hass, entry, clien
     assert hass.services.has_service(DOMAIN, "confirm_proposal")
 
 
-async def test_services_preserve_receipt_and_retry_identity(hass, entry, client):
+async def test_services_preserve_receipt_and_retry_identity(hass, entry, client, receipt, raw):
     await setup(hass, entry)
     command = {
         "config_entry_id": entry.entry_id,
@@ -74,14 +75,14 @@ async def test_services_preserve_receipt_and_retry_identity(hass, entry, client)
         "proposal_id": "proposal:7",
     }
     with patch.object(
-        entry.runtime_data.client, "command", new=AsyncMock(return_value={"version": 8})
+        entry.runtime_data.client, "command", new=AsyncMock(return_value=receipt)
     ) as send:
         client.side_effect = CannotConnect("Poll failed after acceptance")
         for _ in range(2):
             result = await hass.services.async_call(
                 DOMAIN, "confirm_proposal", command, blocking=True, return_response=True
             )
-            assert result == {"version": 8}
+            assert result == receipt
         assert send.call_args_list[0] == send.call_args_list[1]
         assert send.call_args.args[1]["expected_revision"] == 7
     with pytest.raises(HomeAssistantError):
@@ -103,11 +104,182 @@ async def test_services_preserve_receipt_and_retry_identity(hass, entry, client)
     assert result["revision"] == 7
     diagnostic = await async_get_config_entry_diagnostics(hass, entry)
     assert "test-key" not in str(diagnostic) and "registros.example" not in str(diagnostic)
-    assert "lot-1" not in str(diagnostic)
+    assert raw["chambers"][0]["occupants"][0]["lotId"] not in str(diagnostic)
     old_id = entity_id(hass, entry, "sensor", "cam-1", "quantity")
     assert await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()
     assert entity_id(hass, entry, "sensor", "cam-1", "quantity") == old_id
+
+
+async def test_native_service_rejects_unverified_business_receipt(hass, entry, client, receipt):
+    await setup(hass, entry)
+    client.reset_mock()
+    command = {
+        "config_entry_id": entry.entry_id,
+        "command_id": receipt["commandId"],
+        "expected_revision": 7,
+        "location_id": "cam-1",
+        "proposal_id": "proposal:7",
+    }
+    with patch.object(
+        entry.runtime_data.client, "request", new=AsyncMock(return_value={"version": 8})
+    ) as request:
+        with pytest.raises(HomeAssistantError, match="Invalid command receipt"):
+            await hass.services.async_call(
+                DOMAIN, "confirm_proposal", command, blocking=True, return_response=True
+            )
+        client.assert_not_called()
+        request.return_value = receipt
+        assert (
+            await hass.services.async_call(
+                DOMAIN, "confirm_proposal", command, blocking=True, return_response=True
+            )
+            == receipt
+        )
+        assert request.call_args_list[0] == request.call_args_list[1]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    "status,payload,code",
+    [
+        pytest.param(
+            409,
+            {"_tag": "MovementRejected", "code": "before_entry", "message": "private-detail"},
+            "service_validation_error",
+            id="translated-movement-rejection",
+        ),
+        pytest.param(
+            409,
+            {"_tag": "RevisionConflict", "expectedRevision": 7, "actualRevision": 8},
+            "service_validation_error",
+            id="revision-conflict",
+        ),
+        pytest.param(400, {}, "service_validation_error", id="bad-request"),
+        pytest.param(422, {}, "service_validation_error", id="business-validation"),
+        pytest.param(429, {}, "home_assistant_error", id="rate-limited"),
+        pytest.param(500, {}, "home_assistant_error", id="server-failure"),
+        pytest.param(503, {}, "home_assistant_error", id="unavailable-server"),
+        pytest.param(200, {"version": 8}, "home_assistant_error", id="incomplete-receipt"),
+        pytest.param(
+            200,
+            {
+                "commandId": "00000000-0000-4000-8000-000000000999",
+                "eventId": "production-fact:confirmed",
+                "stream": f"ProductionCentre/{DEFAULT_CENTRE}",
+                "version": 8,
+            },
+            "home_assistant_error",
+            id="unmatched-receipt",
+        ),
+    ],
+)
+async def test_native_websocket_command_errors_preserve_explicit_retry_identity(
+    hass, entry, client, receipt, aiohttp_client, hass_ws_client, status, payload, code
+):
+    received = []
+
+    async def route(request):
+        received.append(await request.json())
+        return web.json_response(payload, status=status)
+
+    app = web.Application()
+    app.router.add_post("/api/production/{centre}/lots/{lot}/movements", route)
+    http = await aiohttp_client(app)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "url": str(http.make_url("/"))}
+    )
+    await setup(hass, entry)
+    client.reset_mock()
+    websocket = await hass_ws_client(hass)
+    command = {
+        "config_entry_id": entry.entry_id,
+        "command_id": receipt["commandId"],
+        "expected_revision": 7,
+        "lot_id": "00000000-0000-4000-8000-000000000101",
+        "occurred_on": "2026-11-27",
+        "source_location_id": "cam-1",
+        "destinations": [{"locationId": "cam-2", "quantity": 1}],
+    }
+    for request_id in (1, 2):
+        # Each attempt is explicitly initiated by the caller with its original UUID/payload.
+        await websocket.send_json(
+            {
+                "id": request_id,
+                "type": "call_service",
+                "domain": DOMAIN,
+                "service": "create_movement",
+                "service_data": command,
+                "return_response": True,
+            }
+        )
+        response = await websocket.receive_json()
+        assert response["id"] == request_id
+        assert response["success"] is False
+        assert response["error"]["code"] == code
+        if payload.get("_tag") == "MovementRejected":
+            assert MOVEMENT_ERRORS[payload["code"]] in response["error"]["message"]
+            assert payload["message"] not in response["error"]["message"]
+        await hass.async_block_till_done()
+        assert len(received) == request_id
+        client.assert_not_called()
+    assert received[0] == received[1]
+    assert received[0]["commandId"] == command["command_id"]
+    assert received[0]["expectedRevision"] == command["expected_revision"]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_native_websocket_lost_receipt_remains_uncertain_until_explicit_retry(
+    hass, entry, client, receipt, aiohttp_client, hass_ws_client
+):
+    received = []
+
+    async def route(request):
+        received.append(await request.json())
+        if len(received) == 1:
+            # The command has reached the server, but its response never reaches HA.
+            request.transport.close()
+        return web.json_response(receipt)
+
+    app = web.Application()
+    app.router.add_post("/api/centres/{centre}/plans", route)
+    http = await aiohttp_client(app)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, "url": str(http.make_url("/"))}
+    )
+    await setup(hass, entry)
+    client.reset_mock()
+    websocket = await hass_ws_client(hass)
+    call = {
+        "type": "call_service",
+        "domain": DOMAIN,
+        "service": "confirm_proposal",
+        "service_data": {
+            "config_entry_id": entry.entry_id,
+            "command_id": receipt["commandId"],
+            "expected_revision": 7,
+            "location_id": "cam-1",
+            "proposal_id": "proposal:7",
+        },
+        "return_response": True,
+    }
+    await websocket.send_json({"id": 1, **call})
+    response = await websocket.receive_json()
+    assert response["success"] is False
+    assert response["error"]["code"] == "home_assistant_error"
+    await hass.async_block_till_done()
+    assert len(received) == 1
+    client.assert_not_called()
+    client.side_effect = CannotConnect("Refresco pendiente")
+    await websocket.send_json({"id": 2, **call})
+    response = await websocket.receive_json()
+    assert response["success"] is True
+    assert response["result"]["response"] == receipt
+    await hass.async_block_till_done()
+    assert len(received) == 2
+    assert received[0] == received[1]
+    assert received[0]["commandId"] == receipt["commandId"]
+    assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 async def test_admin_gate_rejects_reads_and_writes_before_client(hass, entry, client):
@@ -155,9 +327,11 @@ async def test_actions_exist_when_first_connection_fails(hass, entry, client):
         )
 
 
-async def test_task_revision_zero_reaches_api_unchanged(hass, entry, client):
+async def test_task_revision_zero_reaches_api_unchanged(hass, entry, client, receipt):
     await setup(hass, entry)
-    with patch.object(entry.runtime_data.client, "command", new=AsyncMock(return_value={})) as send:
+    with patch.object(
+        entry.runtime_data.client, "command", new=AsyncMock(return_value=receipt)
+    ) as send:
         await hass.services.async_call(
             DOMAIN,
             "complete_task",
@@ -167,7 +341,7 @@ async def test_task_revision_zero_reaches_api_unchanged(hass, entry, client):
                 "expected_revision": 7,
                 "task_id": "task",
                 "task_revision": 0,
-                "result": {},
+                "result": {"kind": "curing_review", "outcome": "ready", "notes": ""},
             },
             blocking=True,
             return_response=True,
@@ -211,7 +385,9 @@ async def test_snapshot_cache_bounded_writes_flush_latest_and_restore_offline(
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_failed_snapshot_cache_does_not_hide_accepted_command(hass, entry, client, raw):
+async def test_failed_snapshot_cache_does_not_hide_accepted_command(
+    hass, entry, client, raw, receipt
+):
     await setup(hass, entry)
     updates = entry.runtime_data.updates
     updates.snapshot_next_write = 0
@@ -225,16 +401,14 @@ async def test_failed_snapshot_cache_does_not_hide_accepted_command(hass, entry,
         "proposal_id": "proposal:7",
     }
     with (
-        patch.object(
-            entry.runtime_data.client, "command", new=AsyncMock(return_value={"version": 8})
-        ),
+        patch.object(entry.runtime_data.client, "command", new=AsyncMock(return_value=receipt)),
         patch.object(updates.spool, "cache", side_effect=HomeAssistantError("cache write failed")),
     ):
         result = await hass.services.async_call(
             DOMAIN, "confirm_proposal", command, blocking=True, return_response=True
         )
         await hass.async_block_till_done()
-        assert result == {"version": 8}
+        assert result == receipt
         assert updates.snapshot_pending["revision"] == 8
         assert updates.spool.data["snapshot"]["revision"] == 7
         assert updates.cache_error == "Dashboard cache pending (HomeAssistantError)"

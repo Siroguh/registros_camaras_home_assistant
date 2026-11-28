@@ -23,7 +23,7 @@ async def main():
         assert snapshot.ready
         assert len(snapshot.tasks) == config["expectedTasks"]
         assert any(
-            sum(o["quantity"] for o in chamber.get("occupants", [])) > 0
+            sum(o["quantity"] for o in chamber["occupants"]) > 0
             for chamber in snapshot.chambers.values()
         )
         page = await client.request(

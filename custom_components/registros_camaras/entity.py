@@ -62,6 +62,9 @@ class RegistrosEntity(CoordinatorEntity[RegistrosCoordinator]):
                 "effective": None,
                 "ideal": None,
                 "automatic": None,
+                "automaticId": None,
+                "automaticOrigin": None,
+                "automaticDeviations": None,
                 "manual": None,
                 "proposal": None,
             },
@@ -70,7 +73,7 @@ class RegistrosEntity(CoordinatorEntity[RegistrosCoordinator]):
     @property
     def extra_state_attributes(self) -> dict:
         return {
-            "active_lots": len(self.chamber.get("occupants", [])) if self.location_id else None,
+            "active_lots": len(self.chamber["occupants"]) if self.location_id else None,
             "centre_id": self.coordinator.client.centre_id,
             "location_id": self.location_id,
             "revision": self.coordinator.data.revision,

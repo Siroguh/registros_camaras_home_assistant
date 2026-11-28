@@ -99,8 +99,34 @@ def _require(condition: bool) -> None:
 
 
 def _timestamp(value: Any) -> None:
-    _require(type(value) in (int, float) and math.isfinite(value))
+    _require(type(value) is int and 0 <= value <= 8_640_000_000_000_000)
     datetime.fromtimestamp(value / 1000, UTC)
+
+
+def decode_sensor_stream(value: Any) -> dict:
+    """Validate the current manifest identically over HTTP and from a saved cache."""
+    try:
+        _require(type(value["apiVersion"]) is int and value["apiVersion"] == 1)
+        for key, expected in (("maxBatchSize", 100), ("maxBatchDelayMillis", 2000)):
+            _require(type(value[key]) is int and value[key] == expected)
+        _require(type(value["revision"]) is int and value["revision"] >= 0)
+        _require(isinstance(value["assignments"], list))
+        ids = set()
+        for assignment in value["assignments"]:
+            for key in ("id", "source", "entityId", "locationId"):
+                _require(isinstance(assignment[key], str) and bool(assignment[key]))
+            _require(assignment["id"] not in ids)
+            ids.add(assignment["id"])
+            _require(assignment["entityId"].startswith("sensor."))
+            _require(assignment["metric"] in {"temperature", "humidity"})
+            _require(type(assignment["position"]) is int and assignment["position"] in {1, 2})
+            for key in ("startsAt", "historyFrom"):
+                _timestamp(assignment[key])
+            if assignment["endsAt"] is not None:
+                _timestamp(assignment["endsAt"])
+        return value
+    except (KeyError, TypeError, ValueError, OverflowError, OSError) as err:
+        raise IncompatibleApi("Invalid sensor stream manifest") from err
 
 
 def decode_snapshot(value: Any, centre_id: str) -> Snapshot:
@@ -112,6 +138,17 @@ def decode_snapshot(value: Any, centre_id: str) -> Snapshot:
         for key in ("revision", "planRevision"):
             _require(type(value[key]) is int and value[key] >= 0)
         _require(isinstance(value["sampledAt"], str))
+        _require(
+            re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+                value["sampledAt"],
+            )
+            is not None
+        )
+        datetime.fromisoformat(value["sampledAt"])
+        _require(isinstance(value["lotCodes"], dict))
+        for lot_id, code in value["lotCodes"].items():
+            _require(isinstance(lot_id, str) and isinstance(code, str))
         for key in ("locations", "chambers", "tasks"):
             _require(isinstance(value[key], list))
         for loc in value["locations"]:
@@ -124,27 +161,43 @@ def decode_snapshot(value: Any, centre_id: str) -> Snapshot:
             _require(
                 chamber["status"] in {"empty", "no_plan", "no_phase", "compatible", "conflict"}
             )
-            _require(isinstance(chamber.get("occupants", []), list))
-            for occupant in chamber.get("occupants", []):
+            _require(isinstance(chamber["occupants"], list))
+            for occupant in chamber["occupants"]:
                 _require(isinstance(occupant["lotId"], str))
                 _require(type(occupant["quantity"]) is int and occupant["quantity"] >= 0)
+                _require(type(occupant["age"]) is int)
+                for key in ("baseVersionId", "privateRevisionId", "stepKey"):
+                    _require(occupant[key] is None or isinstance(occupant[key], str))
+                _validate_limits(occupant["limits"])
+            _require(chamber["automaticId"] is None or isinstance(chamber["automaticId"], str))
+            _validate_deviations(chamber["automaticDeviations"])
+            if (origin := chamber["automaticOrigin"]) is not None:
+                _timestamp(origin["startsAt"])
+                _require(origin["replacesId"] is None or isinstance(origin["replacesId"], str))
+                _require(isinstance(origin["confirmationCommandId"], str))
+                _validate_actor(origin["actor"])
             for key in ("effective", "ideal", "automatic"):
                 _validate_limits(chamber[key])
             if chamber["manual"] is not None:
                 _validate_limits(chamber["manual"]["limits"])
                 _require(chamber["manual"]["limits"] is not None)
                 _require(isinstance(chamber["manual"]["id"], str))
+                _require(isinstance(chamber["manual"]["reason"], str))
+                _validate_actor(chamber["manual"]["actor"])
                 _timestamp(chamber["manual"]["startsAt"])
                 _timestamp(chamber["manual"]["endsAt"])
             if (proposal := chamber["proposal"]) is not None:
                 _require(isinstance(proposal["id"], str))
+                _require(isinstance(proposal["contextKey"], str))
                 _require(type(proposal["overdue"]) is bool)
+                _timestamp(proposal["createdAt"])
                 _timestamp(proposal["dueAt"])
                 _validate_limits(proposal["limits"])
+                _validate_deviations(proposal["deviations"])
         for task in value["tasks"]:
             _require(isinstance(task["id"], str) and isinstance(task["lotId"], str))
             _require(task["status"] in {"pending", "due"})
-            _require(type(task["revision"]) is int)
+            _require(type(task["revision"]) is int and task["revision"] >= 0)
             _timestamp(task["dueAt"])
             _require(task["step"]["kind"] in {"curing_review", "quality_check", "remove_product"})
         return Snapshot(value)
@@ -160,6 +213,35 @@ def _validate_limits(limits: Any) -> None:
         _require(type(bounds["min"]) in (int, float) and math.isfinite(bounds["min"]))
         _require(type(bounds["max"]) in (int, float) and math.isfinite(bounds["max"]))
         _require(bounds["min"] <= bounds["max"])
+        if metric == "humidity":
+            _require(0 <= bounds["min"] <= bounds["max"] <= 100)
+
+
+def _validate_deviations(deviations: Any) -> None:
+    if deviations is None:
+        return
+    for metric in ("temperature", "humidity"):
+        value = deviations[metric]
+        _require(type(value) in (int, float) and math.isfinite(value) and value >= 0)
+
+
+def _validate_actor(actor: Any) -> None:
+    _require(actor["type"] in {"user", "integration"})
+    _require(isinstance(actor["userId"], str) and bool(actor["userId"]))
+    if actor["type"] == "integration":
+        _require(isinstance(actor["keyId"], str) and bool(actor["keyId"]))
+
+
+def decode_command_receipt(value: Any, command_id: str) -> dict:
+    """Business fact IDs are independent of stream/version, but bound to this command."""
+    try:
+        for key in ("commandId", "stream", "eventId"):
+            _require(isinstance(value[key], str) and bool(value[key]))
+        _require(value["commandId"] == command_id)
+        _require(type(value["version"]) is int and value["version"] >= 0)
+        return value
+    except (KeyError, TypeError, ValueError) as err:
+        raise IncompatibleApi("Invalid command receipt") from err
 
 
 MOVEMENT_ERRORS = {
@@ -263,26 +345,9 @@ class RegistrosClient:
         )
 
     async def sensor_stream(self) -> dict:
-        value = await self.request("GET", f"environment/streams/{self.centre_id}")
-        try:
-            _require(type(value["apiVersion"]) is int and value["apiVersion"] == 1)
-            _require(value["maxBatchSize"] == 100 and value["maxBatchDelayMillis"] == 2000)
-            _require(type(value["revision"]) is int and value["revision"] >= 0)
-            _require(isinstance(value["assignments"], list))
-            ids = set()
-            for assignment in value["assignments"]:
-                for key in ("id", "source", "entityId", "locationId"):
-                    _require(isinstance(assignment[key], str) and bool(assignment[key]))
-                _require(assignment["id"] not in ids)
-                ids.add(assignment["id"])
-                _require(assignment["entityId"].startswith("sensor."))
-                for key in ("startsAt", "historyFrom"):
-                    _timestamp(assignment[key])
-                if assignment["endsAt"] is not None:
-                    _timestamp(assignment["endsAt"])
-            return value
-        except (KeyError, TypeError, ValueError, OverflowError, OSError) as err:
-            raise IncompatibleApi("Invalid sensor stream manifest") from err
+        return decode_sensor_stream(
+            await self.request("GET", f"environment/streams/{self.centre_id}")
+        )
 
     async def push_updates(self, batch: dict) -> None:
         receipt = await self.request("POST", "environment/updates", batch)
@@ -292,10 +357,8 @@ class RegistrosClient:
         if (
             receipt.get("commandId") != command_id
             or type(version) is not int
-            or not (
-                (stream == f"ReadingIngestion/{command_id}" and version == 1)
-                or (stream == f"ReadingTransaction/{command_id}" and 4 <= version <= 103)
-            )
+            or stream != f"ReadingTransaction/{command_id}"
+            or not 4 <= version <= 103
             or receipt.get("eventId") != f"{stream}:{version}"
         ):
             raise IncompatibleApi("Unexpected durable ingestion acknowledgement")
@@ -342,4 +405,4 @@ class RegistrosClient:
                 body["reason"] = data["reason"]
         else:
             raise Rejected("Unknown action")
-        return await self.request("POST", path, body)
+        return decode_command_receipt(await self.request("POST", path, body), body["commandId"])

@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -16,7 +17,7 @@ async def test_cross_script_real_http_and_native_store(aiohttp_client, socket_en
     new_source = "https://new-disposable-source.example"
     row = {
         "assignmentId": "closed",
-        "sourceEventId": "original-closed",
+        "sourceEventId": "1970-01-01T00:00:01+00:00:change:" + hashlib.sha256(b"20").hexdigest(),
         "observedAt": 1000,
         "mode": "live",
         "value": 20,
@@ -28,9 +29,14 @@ async def test_cross_script_real_http_and_native_store(aiohttp_client, socket_en
         "commandId": "00000000-0000-4000-8000-000000000123",
         "centreId": "centre",
         "source": source,
-        "readings": [row, {**row, "assignmentId": "good", "sourceEventId": "original-good"}],
+        "readings": [row],
     }
-    healthy = {**row, "assignmentId": "new-good", "sourceEventId": "new-report"}
+    healthy = {
+        **row,
+        "assignmentId": "new-good",
+        "sourceEventId": "1970-01-01T00:00:01.000001+00:00:change:"
+        + hashlib.sha256(b"20").hexdigest(),
+    }
     manifest = {
         "apiVersion": 1,
         "revision": 2,
@@ -42,6 +48,8 @@ async def test_cross_script_real_http_and_native_store(aiohttp_client, socket_en
                 "source": new_source,
                 "entityId": "sensor.temperature",
                 "locationId": "chamber",
+                "metric": "temperature",
+                "position": 1,
                 "startsAt": 0,
                 "endsAt": None,
                 "historyFrom": 0,
@@ -117,7 +125,7 @@ async def test_cross_script_real_http_and_native_store(aiohttp_client, socket_en
             process.kill()
             await process.wait()
     assert b"private-fixture-key" not in stdout + stderr
-    assert b"original-good" not in stdout + stderr
+    assert row["sourceEventId"].encode() not in stdout + stderr
     assert b"disposable-source.example" not in stdout + stderr
     assert len(attempts) == 2, (stdout, stderr)
     if valid_ack:
@@ -128,7 +136,7 @@ async def test_cross_script_real_http_and_native_store(aiohttp_client, socket_en
             "storeVersion": 2,
             "rejectedAttempts": 1,
             "blockedBatches": 1,
-            "blockedReports": 2,
+            "blockedReports": 1,
             "healthyCommandId": attempts[1]["commandId"],
             "healthyReportsAcknowledged": 1,
             "blockedIntactAfterRestart": True,

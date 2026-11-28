@@ -3,15 +3,15 @@
   "config": {
     "step": {
       "user": {"title": "Conectar Registros Cámaras 2", "description": "Introduce la URL de la aplicación y una clave API nativa creada en Cuenta. El servidor debe ofrecer la API de integración v1.", "data": {"url": "URL de la aplicación", "centre_id": "Identificador del centro", "api_key": "Clave API"}},
-      "reauth_confirm": {"title": "Actualizar credenciales", "description": "Introduce una clave API nativa de la nueva aplicación. Si actualizas desde la integración antigua, introduce también la URL nueva.", "data": {"url": "URL de la aplicación", "api_key": "Clave API"}},
+      "reauth_confirm": {"title": "Actualizar credenciales", "description": "Introduce una clave API nativa creada en Cuenta para esta aplicación y centro.", "data": {"api_key": "Clave API"}},
       "reconfigure": {"title": "Actualizar conexión", "description": "Conserva el mismo centro. Deja la clave vacía para mantenerla.", "data": {"url": "URL de la aplicación", "api_key": "Clave API (opcional)"}}
     },
     "error": {"invalid_address": "Introduce un origen HTTP(S) y un identificador de centro válido.", "invalid_auth": "La clave API no es válida o está revocada.", "cannot_connect": "No se puede conectar con la aplicación.", "incompatible_api": "El servidor, centro o versión de API no es compatible."},
-    "abort": {"already_configured": "Este servidor y centro ya están configurados.", "reauth_successful": "Conexión actualizada.", "reconfigure_successful": "Conexión actualizada."}
+    "abort": {"already_configured": "Este servidor y centro ya están configurados."}
   },
   "entity": {
     "sensor": {
-      "setpoint_source": {"name": "Origen de consigna"}, "manual_end": {"name": "Fin de consigna manual"},
+      "setpoint_source": {"name": "Origen de consigna", "state": {"manual": "Manual", "automatic": "Automática", "none": "Ninguna"}}, "manual_end": {"name": "Fin de consigna manual"},
       "quantity": {"name": "Cantidad"}, "lots": {"name": "Lotes"},
       "plan_status": {"name": "Estado del plan", "state": {"empty": "Vacía", "no_plan": "Sin plan", "no_phase": "Sin fase", "compatible": "Compatible", "conflict": "Conflicto"}},
       "temperature_min": {"name": "Consigna mínima de temperatura"}, "temperature_max": {"name": "Consigna máxima de temperatura"},
@@ -21,5 +21,46 @@
     },
     "binary_sensor": {"connection": {"name": "Conexión"}, "proposal_pending": {"name": "Propuesta pendiente"}, "proposal_overdue": {"name": "Propuesta vencida"}, "conflict": {"name": "Conflicto de plan"}, "manual_active": {"name": "Consigna manual activa"}},
     "button": {"refresh": {"name": "Actualizar"}}
+  },
+  "services": {
+    "get_snapshot": {"name": "Consultar centro", "description": "Consultar revisión autoritativa, ubicaciones y tareas. Pending indica que se está reconciliando.", "fields": {
+      "config_entry_id": {"name": "Conexión"}
+    }},
+    "get_lots": {"name": "Consultar lotes", "description": "Consultar una página de inventario. Continuar con nextBefore como before hasta null.", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "before": {"name": "Cursor anterior"}, "search": {"name": "Búsqueda"}, "limit": {"name": "Tamaño de página"}
+    }},
+    "get_lot": {"name": "Consultar ficha del lote", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "lot_id": {"name": "ID del lote"}
+    }},
+    "get_movement_history": {"name": "Consultar historial de movimientos", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "lot_id": {"name": "ID del lote"}
+    }},
+    "get_movement_options": {"name": "Consultar disponibilidad para movimiento", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "lot_id": {"name": "ID del lote"}, "occurred_on": {"name": "Día efectivo"}, "correcting": {"name": "Movimiento que se corrige"}
+    }},
+    "confirm_proposal": {"name": "Confirmar propuesta exacta", "description": "Usar el ID de propuesta y la revisión mostrados. Revisar los datos nuevos tras un conflicto.", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)", "description": "Generar una vez y conservar junto al contenido para todos los reintentos."}, "expected_revision": {"name": "Revisión observada del centro"}, "location_id": {"name": "ID de ubicación"}, "proposal_id": {"name": "ID de propuesta"}
+    }},
+    "complete_task": {"name": "Registrar resultado de tarea", "description": "Enviar un resultado tipado. Completar remove_product no mueve existencias.", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)"}, "expected_revision": {"name": "Revisión observada del centro"}, "task_id": {"name": "ID de tarea"}, "task_revision": {"name": "Revisión observada de tarea"}, "result": {"name": "Resultado tipado"}
+    }},
+    "create_lot": {"name": "Crear lote", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)"}, "expected_revision": {"name": "Revisión observada del centro"}, "code": {"name": "Código del lote"}, "quantity": {"name": "Cantidad"}, "started_on": {"name": "Día de entrada"}
+    }},
+    "create_movement": {"name": "Registrar movimiento", "description": "Los destinos contienen locationId, quantity y contributions opcionales. La API valida disponibilidad y procedencia.", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)"}, "expected_revision": {"name": "Revisión observada del centro"}, "lot_id": {"name": "ID del lote"}, "occurred_on": {"name": "Día efectivo"}, "source_location_id": {"name": "ID de ubicación de origen"}, "destinations": {"name": "Destinos"}, "mix_sources": {"name": "Mezclar procedencias"}, "notes": {"name": "Notas"}
+    }},
+    "correct_movement": {"name": "Corregir movimiento con auditoría", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)"}, "expected_revision": {"name": "Revisión observada del centro"}, "lot_id": {"name": "ID del lote"}, "occurred_on": {"name": "Día efectivo"}, "source_location_id": {"name": "ID de ubicación de origen"}, "destinations": {"name": "Destinos"}, "mix_sources": {"name": "Mezclar procedencias"}, "notes": {"name": "Notas"}, "movement_id": {"name": "ID de movimiento"}, "reason": {"name": "Motivo"}
+    }},
+    "schedule_manual": {"name": "Establecer consigna manual", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)"}, "expected_revision": {"name": "Revisión observada del centro"}, "location_id": {"name": "ID de ubicación"}, "reason": {"name": "Motivo"}, "limits": {"name": "Límites"}, "starts_at": {"name": "Inicio", "description": "Instante Unix en milisegundos."}, "ends_at": {"name": "Fin", "description": "Instante Unix en milisegundos."}
+    }},
+    "replace_manual": {"name": "Sustituir consigna manual", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)"}, "expected_revision": {"name": "Revisión observada del centro"}, "location_id": {"name": "ID de ubicación"}, "reason": {"name": "Motivo"}, "limits": {"name": "Límites"}, "starts_at": {"name": "Inicio", "description": "Instante Unix en milisegundos."}, "ends_at": {"name": "Fin", "description": "Instante Unix en milisegundos."}, "manual_id": {"name": "ID de consigna manual"}
+    }},
+    "finish_manual": {"name": "Finalizar consigna manual", "fields": {
+      "config_entry_id": {"name": "Conexión"}, "command_id": {"name": "ID de comando (UUID)"}, "expected_revision": {"name": "Revisión observada del centro"}, "location_id": {"name": "ID de ubicación"}, "manual_id": {"name": "ID de consigna manual"}, "reason": {"name": "Motivo"}
+    }}
   }
 }

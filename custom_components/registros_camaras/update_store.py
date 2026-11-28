@@ -2,14 +2,19 @@
 
 import asyncio
 from copy import deepcopy
+import hashlib
+import json
 import math
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE
+from homeassistant.const import CONF_URL, EVENT_HOMEASSISTANT_FINAL_WRITE
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
+
+from .api import IncompatibleApi, decode_sensor_stream, decode_snapshot, normalize_url
+from .const import CONF_CENTRE_ID
 
 MAX_REPORTS = 50000
 MEMORY_REPORTS = 10000
@@ -29,17 +34,35 @@ class IncompleteHistoryFull(HomeAssistantError):
     """The incomplete-history reserve cannot accept this recovery window."""
 
 
-class UpdateIndexStore(Store):
-    """v2 prevents old clients from resending quarantined rows with new commands."""
-
-    async def _async_migrate_func(self, old_major_version, old_minor_version, old_data):
-        if old_major_version != 1:
-            raise HomeAssistantError("Unsupported sensor queue version")
-        return old_data
-
-
 def identity(source: str, row: dict) -> tuple[str, str, str]:
     return source, row["assignmentId"], row["sourceEventId"]
+
+
+def require(condition: bool) -> None:
+    if not condition:
+        raise ValueError("Invalid sensor queue structure")
+
+
+def is_uuid(value) -> bool:
+    return isinstance(value, str) and str(UUID(value)) == value
+
+
+def validate_row(row) -> None:
+    require(
+        isinstance(row, dict)
+        and row.keys()
+        == {"assignmentId", "sourceEventId", "observedAt", "mode", "value", "unit", "status"}
+    )
+    for name in ("assignmentId", "sourceEventId"):
+        require(isinstance(row[name], str) and bool(row[name]))
+    require(type(row["observedAt"]) is int and row["observedAt"] >= 0)
+    require(row["mode"] in {"live", "history"})
+    require(isinstance(row["unit"], str) and len(row["unit"]) <= 20)
+    require(row["status"] in {"valid", "invalid", "unavailable"})
+    if row["status"] == "valid":
+        require(type(row["value"]) in (float, int) and math.isfinite(row["value"]))
+    else:
+        require(row["value"] is None)
 
 
 class UpdateStore:
@@ -47,6 +70,7 @@ class UpdateStore:
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self.hass = hass
+        self.entry_id = entry_id
         self.key = f"registros_camaras.updates.{entry_id}"
         self.store = self.make_store()
         self.lock = asyncio.Lock()
@@ -60,7 +84,7 @@ class UpdateStore:
 
     def make_store(self, key: str | None = None) -> Store:
         if key is None or key == self.key:
-            return UpdateIndexStore(
+            return Store(
                 self.hass,
                 2,
                 self.key,
@@ -78,49 +102,161 @@ class UpdateStore:
         )
 
     async def initialize(self) -> None:
-        value = await self.store.async_load()
+        try:
+            value = await self.store.async_load()
+        except NotImplementedError as err:
+            raise HomeAssistantError("Unsupported sensor queue version") from err
         self.garbage = await self.hass.async_add_executor_job(self.stored_keys)
         if value is None and self.garbage:
             raise HomeAssistantError("Sensor queue index missing; stored files require recovery")
         if value is not None:
-            if not isinstance(value, dict):
-                raise HomeAssistantError("Invalid stored sensor update queue")
-            if "segments" in value:
-                rows = []
-                for segment in value["segments"]:
-                    items = await self.make_store(segment["key"]).async_load()
-                    if not isinstance(items, list):
-                        raise HomeAssistantError("Missing sensor update segment")
-                    self.segments.append((segment, items))
-                    rows.extend(items[segment["start"] :])
-                value = {**value, "rows": rows}
-            if not (
-                isinstance(value, dict)
-                and isinstance(value.get("rows"), list)
-                and isinstance(value.get("cursors"), dict)
-                and "batch" in value
-            ):
-                raise HomeAssistantError("Invalid stored sensor update queue")
-            self.data = value
-            for blocked in value.get("blocked", []):
-                frozen = await self.make_store(blocked["key"]).async_load()
-                if not isinstance(frozen, dict) or frozen.get("commandId") != blocked["commandId"]:
-                    raise HomeAssistantError("Missing blocked sensor batch")
-                self.blocked_batches[blocked["key"]] = frozen
+            await self.restore(value)
             self.cache_key = value.get("cache_key")
             if self.cache_key:
                 cached = await self.make_store(self.cache_key).async_load()
-                if isinstance(cached, dict):
+                if valid := self.validate_cache(cached):
+                    # Keep the original file until the next verified commit rewrites
+                    # any rejected part. A bad snapshot must not delete a valid manifest.
                     self.cached = cached
-                    self.data = {**value, **cached}
+                    self.data.update(valid)
                 else:
                     # The queue is authoritative; this optional cache can be fetched online.
                     self.cache_key = None
         await self.cleanup()
 
+    def validate_cache(self, cached) -> dict:
+        """Decode independent rebuildable projections, bound to the configured destination."""
+        if not isinstance(cached, dict) or cached.keys() - {"manifest", "snapshot"}:
+            return {}
+        valid = {}
+        if "manifest" in cached:
+            try:
+                valid["manifest"] = decode_sensor_stream(cached["manifest"])
+            except IncompatibleApi:
+                pass
+        if "snapshot" in cached and (
+            entry := self.hass.config_entries.async_get_entry(self.entry_id)
+        ):
+            try:
+                centre = entry.data[CONF_CENTRE_ID]
+                require(isinstance(centre, str) and bool(centre))
+                destination = hashlib.sha256(
+                    json.dumps([normalize_url(entry.data[CONF_URL]), centre]).encode()
+                ).hexdigest()
+                require(destination == self.data.get("destination"))
+                valid["snapshot"] = decode_snapshot(cached["snapshot"], centre).raw
+            except IncompatibleApi, KeyError, TypeError, ValueError:
+                pass
+        return valid
+
+    def validate_key(self, key, kind: str) -> None:
+        prefix = f"{self.key}.files/{kind}."
+        require(isinstance(key, str) and key.startswith(prefix))
+        require(is_uuid(key.removeprefix(prefix)))
+
+    async def restore(self, value) -> None:
+        """Accept only the current index and its complete, mutually consistent files.
+
+        Validate everything before installing metadata or collecting orphan files.
+        Frozen commands must own exact queued payloads, never reconstructed batches.
+        """
+        try:
+            require(isinstance(value, dict))
+            require({"segments", "batch", "cursors", "commit"} <= value.keys())
+            require(
+                value.keys()
+                <= {"segments", "batch", "cursors", "commit", "destination", "blocked", "cache_key"}
+            )
+            require(is_uuid(value["commit"]))
+            require(isinstance(value["cursors"], dict))
+            for assignment, cursor in value["cursors"].items():
+                require(isinstance(assignment, str) and bool(assignment))
+                require(type(cursor) is int and cursor >= 0)
+            if "destination" in value:
+                destination = value["destination"]
+                require(isinstance(destination, str) and len(destination) == 64)
+                require(all(char in "0123456789abcdef" for char in destination))
+            if "cache_key" in value:
+                self.validate_key(value["cache_key"], "cache")
+            require(isinstance(value["segments"], list))
+            segments = []
+            rows = []
+            keys = set()
+            for descriptor in value["segments"]:
+                require(isinstance(descriptor, dict) and descriptor.keys() == {"key", "start"})
+                key = descriptor["key"]
+                self.validate_key(key, "segment")
+                require(key not in keys)
+                keys.add(key)
+                items = await self.make_store(key).async_load()
+                require(isinstance(items, list) and 0 < len(items) <= SEGMENT_REPORTS)
+                require(type(descriptor["start"]) is int and 0 <= descriptor["start"] < len(items))
+                groups = set()
+                for item in items:
+                    require(isinstance(item, list) and len(item) == 2)
+                    source, row = item
+                    require(isinstance(source, str) and bool(source))
+                    validate_row(row)
+                    groups.add((source, row["assignmentId"]))
+                require(len(groups) == 1)
+                segments.append((descriptor, items))
+                rows.extend(items[descriptor["start"] :])
+            queued = {identity(*item): item[1] for item in rows}
+            require(len(queued) == len(rows))
+            incomplete = sum(incomplete_history(row) for _, row in rows)
+            require(incomplete <= MAX_INCOMPLETE_REPORTS)
+            require(len(rows) - incomplete <= MAX_REPORTS + MEMORY_REPORTS)
+            claimed = set()
+            commands = set()
+
+            def validate_batch(batch):
+                require(
+                    isinstance(batch, dict)
+                    and batch.keys()
+                    == {"apiVersion", "commandId", "centreId", "source", "readings"}
+                )
+                require(type(batch["apiVersion"]) is int and batch["apiVersion"] == 1)
+                require(is_uuid(batch["commandId"]) and batch["commandId"] not in commands)
+                commands.add(batch["commandId"])
+                require(isinstance(batch["centreId"], str) and bool(batch["centreId"]))
+                require(isinstance(batch["source"], str) and bool(batch["source"]))
+                require(isinstance(batch["readings"], list) and 0 < len(batch["readings"]) <= 100)
+                assignments = set()
+                for row in batch["readings"]:
+                    validate_row(row)
+                    require(not incomplete_history(row))
+                    key = identity(batch["source"], row)
+                    require(key not in claimed and queued.get(key) == row)
+                    claimed.add(key)
+                    assignments.add(row["assignmentId"])
+                require(len(assignments) == 1)
+
+            if value["batch"] is not None:
+                validate_batch(value["batch"])
+            blocked_batches = {}
+            require(isinstance(value.get("blocked", []), list))
+            for descriptor in value.get("blocked", []):
+                require(
+                    isinstance(descriptor, dict)
+                    and descriptor.keys() == {"key", "commandId", "reason"}
+                )
+                key = descriptor["key"]
+                self.validate_key(key, "blocked")
+                require(descriptor["reason"] == "assignment_window")
+                require(key == f"{self.key}.files/blocked.{descriptor['commandId']}")
+                frozen = await self.make_store(key).async_load()
+                validate_batch(frozen)
+                require(frozen["commandId"] == descriptor["commandId"])
+                blocked_batches[key] = frozen
+        except (KeyError, TypeError, ValueError, OverflowError, NotImplementedError) as err:
+            raise HomeAssistantError("Invalid stored sensor update queue") from err
+        self.segments = segments
+        self.data = {**value, "rows": rows}
+        self.blocked_batches = blocked_batches
+
     def stored_keys(self) -> set[str]:
         root = Path(self.store.path).parent
-        return {path.name for path in root.glob(f"{self.key}.segment.*")} | {
+        return {
             f"{self.key}.files/{path.name}"
             for path in (root / f"{self.key}.files").glob("*")
             if path.name.startswith(("segment.", "cache.", "blocked."))
@@ -172,17 +308,7 @@ class UpdateStore:
         remaining = {identity(*item): item for item in data["rows"]}
         known = set()
         segments = []
-        regroup = set()
-        for _, items in self.segments:
-            groups = {(source, row["assignmentId"]) for source, row in items}
-            if len(groups) > 1:
-                regroup.update(groups)
         for descriptor, items in self.segments:
-            if (items[0][0], items[0][1]["assignmentId"]) in regroup:
-                # Migrate every segment of a legacy mixed group in original row order,
-                # including pure tails. Otherwise an old tail could precede its head.
-                # Original files survive until the new index is verified below.
-                continue
             start = descriptor["start"]
             while start < len(items) and identity(*items[start]) not in remaining:
                 start += 1
@@ -232,9 +358,7 @@ class UpdateStore:
                 self.garbage.add(cache_key)
                 await self.verified_save(self.make_store(cache_key), cached)
         metadata = {
-            k: v
-            for k, v in data.items()
-            if k not in {"rows", "segments", "snapshot", "manifest", "cache_key"}
+            k: v for k, v in data.items() if k in {"batch", "cursors", "destination", "blocked"}
         }
         if cache_key:
             metadata["cache_key"] = cache_key
@@ -261,9 +385,17 @@ class UpdateStore:
                     {"rows": [], "batch": None, "cursors": {}, "destination": destination}
                 )
             if previous is None:
+                if (
+                    self.data["rows"]
+                    or self.data["batch"] is not None
+                    or self.data["cursors"]
+                    or {"manifest", "snapshot", "cache_key"} & self.data.keys()
+                ):
+                    raise HomeAssistantError("Nonempty sensor storage has no destination")
                 await self.save({**self.data, "destination": destination})
 
     async def cache(self, **values) -> None:
+        require(values.keys() <= {"manifest", "snapshot"})
         async with self.lock:
             await self.save({**self.data, **deepcopy(values)})
 
@@ -276,16 +408,19 @@ class UpdateStore:
     ) -> None:
         async with self.lock:
             known = {identity(source, row): row for source, row in self.data["rows"]}
+            frozen = self.blocked_identities()
+            if batch := self.data["batch"]:
+                frozen.update(identity(batch["source"], row) for row in batch["readings"])
             added = []
             replacements = {}
             for source, row in rows:
-                if row["value"] is not None and not math.isfinite(row["value"]):
-                    raise ValueError("Non-finite sensor reading")
+                validate_row(row)
                 key = identity(source, row)
                 if key in known:
-                    original = {k: v for k, v in known[key].items() if k != "mode"}
+                    prior = known[key]
+                    promote = incomplete_history(prior) and row["mode"] == "live"
+                    original = {k: v for k, v in prior.items() if k != "mode"}
                     if original != {k: v for k, v in row.items() if k != "mode"}:
-                        prior = known[key]
 
                         def comparable(value):
                             return {k: v for k, v in value.items() if k not in {"mode", "unit"}}
@@ -299,9 +434,15 @@ class UpdateStore:
                             and comparable(prior) == comparable(row)
                         ):
                             raise HomeAssistantError("Conflicting sensor report identity")
-                        if prior["mode"] == "history":
-                            replacements[key] = deepcopy(live)
-                            known[key] = replacements[key]
+                        promote = prior["mode"] == "history"
+                    if promote:
+                        # Missing-unit live reports must reach the server too. The
+                        # exact live observation supersedes only unfrozen history,
+                        # even when the payload differs solely in transport mode.
+                        if key in frozen:
+                            raise HomeAssistantError("Conflicting frozen sensor report identity")
+                        replacements[key] = deepcopy(row)
+                        known[key] = replacements[key]
                     continue
                 known[key] = row
                 added.append([source, deepcopy(row)])
@@ -310,10 +451,8 @@ class UpdateStore:
             incomplete = sum(incomplete_history(row) for row in known.values())
             if len(known) - incomplete > capacity:
                 raise ReportCapacityFull("Sensor update queue capacity reached")
-            # Incomplete history cannot consume live delivery capacity. Preserve any
-            # larger pre-upgrade reserve, but never grow it or advance a failed cursor.
-            prior_incomplete = sum(incomplete_history(row) for _, row in self.data["rows"])
-            if incomplete > max(MAX_INCOMPLETE_REPORTS, prior_incomplete):
+            # Incomplete history cannot consume live delivery capacity.
+            if incomplete > MAX_INCOMPLETE_REPORTS:
                 raise IncompleteHistoryFull("Incomplete sensor history capacity reached")
             cursors = {**self.data["cursors"]}
             if cursor:

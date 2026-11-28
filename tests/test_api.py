@@ -11,6 +11,8 @@ from custom_components.registros_camaras.api import (
     IncompatibleApi,
     RegistrosClient,
     Rejected,
+    decode_command_receipt,
+    decode_sensor_stream,
     decode_snapshot,
     normalize_url,
 )
@@ -38,6 +40,246 @@ def test_invalid_snapshot(raw):
         decode_snapshot(raw, DEFAULT_CENTRE)
 
 
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("sampledAt",), "not-a-date"),
+        (("sampledAt",), "2026-11-27"),
+        (("sampledAt",), "2026-11-27T12:00:00"),
+        (("sampledAt",), "2026-02-30T12:00:00Z"),
+        (("lotCodes",), []),
+        (("lotCodes",), {"lot-1": 12}),
+        (("revision",), -1),
+        (("planRevision",), True),
+        (("tasks", 0, "revision"), -1),
+        (("tasks", 0, "revision"), True),
+        (("chambers", 0, "occupants"), None),
+        (("chambers", 0, "automaticId"), 123),
+        (("chambers", 0, "automaticOrigin"), {}),
+        (("chambers", 0, "automaticDeviations"), {}),
+        (("chambers", 0, "automaticDeviations"), {"temperature": True, "humidity": 0}),
+        (("chambers", 0, "proposal", "deviations"), {"temperature": 0, "humidity": -1}),
+        (("chambers", 0, "proposal", "createdAt"), -1),
+        (("chambers", 0, "proposal", "createdAt"), True),
+    ],
+)
+def test_malformed_snapshot_fields_fail_closed(raw, path, value):
+    target = raw
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(IncompatibleApi):
+        decode_snapshot(raw, DEFAULT_CENTRE)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("lotCodes",),
+        ("chambers", 0, "occupants"),
+        ("chambers", 0, "automaticId"),
+        ("chambers", 0, "automaticOrigin"),
+        ("chambers", 0, "automaticDeviations"),
+        ("chambers", 0, "proposal", "deviations"),
+        ("chambers", 0, "occupants", 0, "limits"),
+        ("chambers", 0, "proposal", "createdAt"),
+    ],
+)
+def test_snapshot_required_fields_cannot_be_defaulted(raw, path):
+    target = raw
+    for key in path[:-1]:
+        target = target[key]
+    del target[path[-1]]
+    with pytest.raises(IncompatibleApi):
+        decode_snapshot(raw, DEFAULT_CENTRE)
+
+
+def test_manual_reason_required_and_nullable_automatic_origin(raw):
+    chamber = raw["chambers"][0]
+    chamber.update(automaticId=None, automaticOrigin=None)
+    chamber["manual"] = {
+        "id": "00000000-0000-4000-8000-000000000105",
+        "limits": chamber["effective"],
+        "startsAt": 1,
+        "endsAt": 2,
+        "actor": {"type": "user", "userId": "operator"},
+        "reason": "Inspection",
+    }
+    assert decode_snapshot(raw, DEFAULT_CENTRE).ready
+    del chamber["manual"]["reason"]
+    with pytest.raises(IncompatibleApi):
+        decode_snapshot(raw, DEFAULT_CENTRE)
+
+
+@pytest.fixture
+def manifest():
+    return {
+        "apiVersion": 1,
+        "revision": 0,
+        "maxBatchSize": 100,
+        "maxBatchDelayMillis": 2000,
+        "assignments": [
+            {
+                "id": "assignment",
+                "source": "https://home.example",
+                "entityId": "sensor.temperature",
+                "locationId": "cam-1",
+                "metric": "temperature",
+                "position": 1,
+                "startsAt": 0,
+                "endsAt": None,
+                "historyFrom": 0,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("metric", "pressure"),
+        ("metric", None),
+        ("position", 0),
+        ("position", 3),
+        ("position", True),
+        ("position", 1.0),
+        ("startsAt", -1),
+        ("startsAt", True),
+        ("startsAt", 1.5),
+        ("endsAt", -1),
+        ("endsAt", False),
+        ("endsAt", 1.0),
+        ("historyFrom", -1),
+        ("historyFrom", True),
+        ("historyFrom", "1"),
+    ],
+)
+def test_manifest_decoder_rejects_invalid_assignment_fields(manifest, key, value):
+    manifest["assignments"][0][key] = value
+    with pytest.raises(IncompatibleApi):
+        decode_sensor_stream(manifest)
+
+
+@pytest.mark.parametrize("key", ["metric", "position", "startsAt", "endsAt", "historyFrom"])
+def test_manifest_decoder_requires_current_assignment_fields(manifest, key):
+    del manifest["assignments"][0][key]
+    with pytest.raises(IncompatibleApi):
+        decode_sensor_stream(manifest)
+
+
+@pytest.mark.parametrize("metric,position", [("temperature", 1), ("humidity", 2)])
+async def test_sensor_manifest_http_and_cache_use_same_contract(
+    aiohttp_client, socket_enabled, manifest, metric, position
+):
+    manifest["assignments"][0].update(metric=metric, position=position)
+
+    async def route(request):
+        return web.json_response(manifest)
+
+    app = web.Application()
+    app.router.add_get("/api/environment/streams/" + DEFAULT_CENTRE, route)
+    http = await aiohttp_client(app)
+    client = RegistrosClient(http.session, str(http.make_url("/")), "test-key", DEFAULT_CENTRE)
+    assert await client.sensor_stream() == decode_sensor_stream(manifest)
+    manifest["assignments"][0]["position"] = True
+    with pytest.raises(IncompatibleApi):
+        await client.sensor_stream()
+
+
+@pytest.mark.parametrize("key", ["commandId", "eventId", "stream", "version"])
+def test_business_receipt_requires_every_field(receipt, key):
+    command_id = receipt["commandId"]
+    del receipt[key]
+    with pytest.raises(IncompatibleApi):
+        decode_command_receipt(receipt, command_id)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"commandId": "00000000-0000-4000-8000-000000000999"},
+        {"commandId": None},
+        {"eventId": ""},
+        {"eventId": 123},
+        {"stream": ""},
+        {"stream": None},
+        {"version": True},
+        {"version": -1},
+        {"version": 8.0},
+        {"version": "8"},
+    ],
+)
+def test_business_receipt_invalid_fields(receipt, change):
+    with pytest.raises(IncompatibleApi):
+        decode_command_receipt({**receipt, **change}, receipt["commandId"])
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "confirm_proposal",
+        "complete_task",
+        "create_lot",
+        "schedule_manual",
+        "replace_manual",
+        "finish_manual",
+        "create_movement",
+        "correct_movement",
+    ],
+)
+async def test_every_business_command_validates_its_receipt(
+    aiohttp_client, socket_enabled, receipt, action
+):
+    returned = receipt.copy()
+
+    async def route(request):
+        assert (await request.json())["commandId"] == receipt["commandId"]
+        return web.json_response(returned)
+
+    app = web.Application()
+    app.router.add_post("/api/{tail:.*}", route)
+    http = await aiohttp_client(app)
+    client = RegistrosClient(http.session, str(http.make_url("/")), "test-key", DEFAULT_CENTRE)
+    data = {
+        "command_id": receipt["commandId"],
+        "expected_revision": 7,
+        "location_id": "cam-1",
+        "proposal_id": "proposal:7",
+        "task_id": "task:1",
+        "task_revision": 0,
+        "result": {
+            "kind": "quality_check",
+            "outcome": "passed",
+            "sampleSize": 1,
+            "nonconforming": 0,
+            "notes": "",
+        },
+        "code": "A",
+        "quantity": 1,
+        "started_on": "2026-11-27",
+        "reason": "Inspection",
+        "manual_id": "00000000-0000-4000-8000-000000000105",
+        "limits": {"temperature": {"min": 2, "max": 6}, "humidity": {"min": 50, "max": 70}},
+        "starts_at": 1795777200000,
+        "ends_at": 1795777500000,
+        "lot_id": "00000000-0000-4000-8000-000000000101",
+        "occurred_on": "2026-11-27",
+        "source_location_id": "cam-1",
+        "destinations": [{"locationId": "cam-2", "quantity": 1}],
+        "movement_id": "00000000-0000-4000-8000-000000000106",
+    }
+    # Facts may have an ID independent of the stream and revision.
+    assert receipt["eventId"] != f"{receipt['stream']}:{receipt['version']}"
+    assert await client.command(action, data) == receipt
+    returned["commandId"] = "00000000-0000-4000-8000-000000000999"
+    with pytest.raises(IncompatibleApi):
+        await client.command(action, data)
+    returned.clear()
+    returned["version"] = 8
+    with pytest.raises(IncompatibleApi):
+        await client.command(action, data)
+
+
 def test_storage_locations_keep_dashboard_entities(raw):
     raw["locations"].extend(
         [
@@ -62,7 +304,7 @@ def test_storage_locations_keep_dashboard_entities(raw):
     assert "finalizado" not in snapshot.locations
 
 
-async def test_http_contract_and_exact_retries(aiohttp_client, socket_enabled, raw):
+async def test_http_contract_and_exact_retries(aiohttp_client, socket_enabled, raw, receipt):
     requests = []
 
     async def route(request):
@@ -70,7 +312,7 @@ async def test_http_contract_and_exact_retries(aiohttp_client, socket_enabled, r
         if request.method == "GET":
             return web.json_response(raw)
         requests.append((request.path, await request.json()))
-        return web.json_response({"version": 8})
+        return web.json_response(receipt)
 
     app = web.Application()
     app.router.add_route("*", "/api/{tail:.*}", route)
@@ -112,7 +354,7 @@ async def test_http_contract_and_exact_retries(aiohttp_client, socket_enabled, r
         "create_movement",
         {
             **command,
-            "lot_id": "lot-1",
+            "lot_id": "00000000-0000-4000-8000-000000000101",
             "source_location_id": "cam-1",
             "occurred_on": "2026-11-27",
             "destinations": [{"locationId": "cam-2", "quantity": 5}],
@@ -158,11 +400,25 @@ def test_translation_keys_and_service_descriptions():
     from custom_components.registros_camaras.services import SCHEMAS
 
     root = Path(__file__).parents[1] / "custom_components/registros_camaras"
-    assert json.loads((root / "strings.json").read_text()) == json.loads(
-        (root / "translations/en.json").read_text()
-    )
+    strings = json.loads((root / "strings.json").read_text())
+    assert strings == json.loads((root / "translations/en.json").read_text())
+    spanish = json.loads((root / "translations/es.json").read_text())
+
+    def keys(value, prefix=()):
+        return {
+            path
+            for key, child in value.items()
+            for path in (
+                keys(child, (*prefix, key)) if isinstance(child, dict) else {(*prefix, key)}
+            )
+        }
+
+    assert keys(spanish) == keys(strings)
     descriptions = yaml.safe_load((root / "services.yaml").read_text())
-    assert descriptions.keys() == SCHEMAS.keys()
+    assert descriptions.keys() == strings["services"].keys() == SCHEMAS.keys()
+    for name, schema in SCHEMAS.items():
+        assert descriptions[name]["fields"].keys() == {key.schema for key in schema}
+        assert strings["services"][name]["fields"].keys() == descriptions[name]["fields"].keys()
 
 
 async def test_business_rejection_is_not_a_stale_revision(aiohttp_client, socket_enabled):
@@ -205,10 +461,12 @@ def test_command_integer_conversion_never_truncates(value):
 @pytest.mark.parametrize("end", [None, "tomorrow", float("inf"), 10**30])
 def test_invalid_manual_end_is_rejected_before_entity_update(raw, end):
     raw["chambers"][0]["manual"] = {
-        "id": "manual",
+        "id": "00000000-0000-4000-8000-000000000105",
         "startsAt": 1,
         "endsAt": end,
         "limits": raw["chambers"][0]["effective"],
+        "reason": "Inspection",
+        "actor": {"type": "user", "userId": "operator"},
     }
     with pytest.raises(IncompatibleApi):
         decode_snapshot(raw, DEFAULT_CENTRE)
@@ -314,7 +572,7 @@ async def test_untrusted_status_never_proves_batch_rejection(
 @pytest.mark.parametrize(
     "stream_kind,version,change,accepted",
     [
-        ("ReadingIngestion", 1, {}, True),
+        ("ReadingIngestion", 1, {}, False),
         ("ReadingTransaction", 4, {}, True),
         ("ReadingTransaction", 7, {}, True),
         ("ReadingTransaction", 103, {}, True),
@@ -339,7 +597,7 @@ async def test_untrusted_status_never_proves_batch_rejection(
         ("ReadingTransaction", None, {}, False),
     ],
 )
-async def test_updates_final_and_legacy_receipts_are_exact_and_command_bound(
+async def test_only_final_transaction_receipts_are_exact_and_command_bound(
     aiohttp_client, socket_enabled, stream_kind, version, change, accepted
 ):
     command_id = "00000000-0000-4000-8000-000000000123"
